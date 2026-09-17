@@ -90,10 +90,24 @@ score trades cached blocks against load (short prompts lose), and its index only
 worker's blocks after the worker publishes KV events (bursts of turns get spread). JSEW records
 the prefix in its shadow index at routing time.
 
+## Future work
+
+- **Second-tier (G2) KV cache in host DRAM, write-back vs. write-through.** The shadow index
+  models one tier per worker: a block is either in GPU KV or must be prefilled. With a DRAM tier
+  (Dynamo KVBM, vLLM CPU offload) a hit is three-valued: GPU hit is free, DRAM hit costs a
+  transfer of the block over the host link, miss recomputes. The score should charge a DRAM hit
+  its transfer time instead of zero (the KV router already exposes separate host- and disk-hit
+  weights), the shadow index needs a third block state that survives GPU eviction, and the
+  write policy decides who pays the host bandwidth: *write-through* copies every produced block,
+  so the host link carries the full prefill token rate and becomes a capacity constraint the
+  router cannot influence; *write-back* copies only on GPU eviction, so host traffic equals the
+  eviction rate, which routing and retention control. Measuring both at a fixed GPU cache on the
+  Claude Code trace is the next experiment.
+- **Rust in-process variant** as a custom worker-selection policy
+  ([`../custom-policy-example`](../custom-policy-example/README.md)). Dynamo exposes
+  device/host/disk overlap, active prefill tokens and decode cost per candidate, which cover the
+  score above except the attained-service decode estimator.
+
 ## Notes
 
-- A Rust in-process variant as a custom worker-selection policy (see
-  [`../custom-policy-example`](../custom-policy-example/README.md)) is the natural next step;
-  Dynamo exposes device/host/disk overlap, active prefill tokens and decode cost per candidate,
-  which cover the score above except the attained-service decode estimator.
 - The proxy tokenizes once more than the frontend does when requests are not pre-tokenized.
