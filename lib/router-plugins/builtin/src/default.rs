@@ -3,12 +3,12 @@
 
 //! The default KV policy, composed from a scorer and a picker using the public plugin API.
 
-mod parameters;
-mod picker;
-mod scorer;
+pub(crate) mod parameters;
+pub(crate) mod picker;
+pub(crate) mod scorer;
 mod selector;
 
-use parameters::PolicyParameters;
+pub(crate) use parameters::PolicyParameters;
 pub(super) use parameters::register;
 pub use selector::DefaultWorkerSelector;
 
@@ -46,13 +46,17 @@ pub fn default_factory() -> WorkerSelectionPolicyFactory {
     })
 }
 
+/// Whether `role` is a plain disaggregated decode pool (load-only scoring, no cache credit).
+pub(crate) fn is_plain_decode(config: &KvRouterConfig, role: dynamo_kv_router::WorkerType) -> bool {
+    role == dynamo_kv_router::WorkerType::Decode && !config.conditional_disagg_enabled
+}
+
 fn policy_for_role(
     config: KvRouterConfig,
     role: dynamo_kv_router::WorkerType,
     parameters: PolicyParameters,
 ) -> WorkerSelectionPolicy {
-    let is_plain_decode =
-        role == dynamo_kv_router::WorkerType::Decode && !config.conditional_disagg_enabled;
+    let is_plain_decode = is_plain_decode(&config, role);
     policy_with_rng(
         config,
         parameters,

@@ -11,7 +11,7 @@ use dynamo_kv_router::plugins::worker_selection::{
 
 /// Resolve optional terms once so disabled weights add neither branches nor conversions to
 /// each worker score. The shared-cache specialization also omits range traversal code.
-pub(super) fn build(
+pub(crate) fn build(
     config: &PolicyParameters,
     worker_label: &'static str,
     is_plain_decode: bool,

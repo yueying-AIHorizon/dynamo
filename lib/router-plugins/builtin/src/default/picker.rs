@@ -9,7 +9,7 @@ use dynamo_kv_router::plugins::worker_selection::{
 use parking_lot::Mutex;
 use std::sync::Arc;
 
-fn softmax_sample_index<T>(
+pub(crate) fn softmax_sample_index<T>(
     entries: &[T],
     cost: impl Fn(&T) -> f64,
     temperature: f64,
