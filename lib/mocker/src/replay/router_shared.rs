@@ -11,8 +11,10 @@ use dynamo_kv_router::protocols::{
 };
 use dynamo_kv_router::scheduling::queue::DEFAULT_MAX_BATCHED_TOKENS;
 use dynamo_kv_router::sequences::SchedulerLoadSnapshot;
+use dynamo_kv_router::protocols::WorkerSelectionResult;
 use dynamo_kv_router::{
-    ActiveSequencesMultiWorker, DefaultWorkerSelector, LocalScheduler, SequencePublisher,
+    ActiveSequencesMultiWorker, DefaultWorkerSelector, KvSchedulerError, LocalScheduler,
+    SequencePublisher, WorkerInputs, WorkerSelectionInput, WorkerSelectionPolicy, WorkerSelector,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -55,7 +57,41 @@ impl WorkerConfigLike for ReplayWorkerConfig {
 }
 
 pub(super) type ReplayScheduler =
-    LocalScheduler<ReplayNoopPublisher, ReplayWorkerConfig, DefaultWorkerSelector>;
+    LocalScheduler<ReplayNoopPublisher, ReplayWorkerConfig, ReplayWorkerSelector>;
+
+/// The selector replay schedules with: Dynamo's stock selector, or a custom
+/// worker-selection policy resolved from the shipped registry when
+/// `router_policy_config` selects one (feature `custom-policy`).
+pub(crate) enum ReplayWorkerSelector {
+    Default(DefaultWorkerSelector),
+    Policy(WorkerSelectionPolicy),
+}
+
+impl<C: WorkerConfigLike> WorkerSelector<C> for ReplayWorkerSelector {
+    fn required_worker_inputs(&self) -> WorkerInputs {
+        match self {
+            Self::Default(selector) => WorkerSelector::<C>::required_worker_inputs(selector),
+            Self::Policy(policy) => WorkerSelector::<C>::required_worker_inputs(policy),
+        }
+    }
+
+    fn uses_exclusive_affinity_target(&self) -> bool {
+        match self {
+            Self::Default(selector) => WorkerSelector::<C>::uses_exclusive_affinity_target(selector),
+            Self::Policy(policy) => WorkerSelector::<C>::uses_exclusive_affinity_target(policy),
+        }
+    }
+
+    fn select_worker(
+        &self,
+        input: WorkerSelectionInput<'_, C>,
+    ) -> Result<WorkerSelectionResult, KvSchedulerError> {
+        match self {
+            Self::Default(selector) => selector.select_worker(input),
+            Self::Policy(policy) => policy.select_worker(input),
+        }
+    }
+}
 
 pub(in crate::replay) fn replay_worker_config(args: &MockEngineArgs) -> ReplayWorkerConfig {
     ReplayWorkerConfig {
@@ -107,28 +143,67 @@ pub(super) fn replay_slots(
     ))
 }
 
-pub(super) fn replay_selector(config: &KvRouterConfig) -> anyhow::Result<DefaultWorkerSelector> {
+pub(super) fn replay_selector(config: &KvRouterConfig) -> anyhow::Result<ReplayWorkerSelector> {
     replay_selector_with_seed(config, None)
 }
 
 pub(super) fn replay_selector_with_seed(
     config: &KvRouterConfig,
     selector_seed: Option<u64>,
-) -> anyhow::Result<DefaultWorkerSelector> {
+) -> anyhow::Result<ReplayWorkerSelector> {
     if let Some(instance) = config
         .selected_worker_selection_policy_instance()
         .map_err(anyhow::Error::from)?
     {
-        anyhow::bail!("custom worker-selection policy {instance:?} is not supported by replay");
+        return custom_replay_selector(config, &instance);
     }
 
-    Ok(match selector_seed {
+    Ok(ReplayWorkerSelector::Default(match selector_seed {
         #[cfg(feature = "replay-bench")]
         Some(seed) => DefaultWorkerSelector::new_seeded(Some(config.clone()), "replay", seed),
         #[cfg(not(feature = "replay-bench"))]
         Some(_) => unreachable!("canonical KV Router replay requires the replay-bench feature"),
         None => DefaultWorkerSelector::new(Some(config.clone()), "replay"),
-    })
+    }))
+}
+
+/// Build the selected custom policy from the registry of policies Dynamo ships
+/// (the same `lib/router-plugins/builtin` catalog the frontend links). Replay
+/// workers are one aggregated pool in one routing partition.
+#[cfg(feature = "custom-policy")]
+fn custom_replay_selector(
+    config: &KvRouterConfig,
+    instance: &str,
+) -> anyhow::Result<ReplayWorkerSelector> {
+    use dynamo_kv_router::services::selection::WorkerSelectionPolicyRegistry;
+    use dynamo_kv_router::{DEFAULT_ROUTING_GROUP, RoutingPartitionRef, WorkerType};
+
+    let mut registry = WorkerSelectionPolicyRegistry::default();
+    dynamo_custom_policy_builtin::register(&mut registry)?;
+    let factory = registry
+        .resolve_for_worker_type(config, WorkerType::Aggregated)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "custom worker-selection policy {instance:?} is selected but resolves to no factory"
+            )
+        })?;
+    let partition = RoutingPartitionRef::new("replay", DEFAULT_ROUTING_GROUP);
+    Ok(ReplayWorkerSelector::Policy(factory(
+        config,
+        WorkerType::Aggregated,
+        partition,
+    )))
+}
+
+#[cfg(not(feature = "custom-policy"))]
+fn custom_replay_selector(
+    _config: &KvRouterConfig,
+    instance: &str,
+) -> anyhow::Result<ReplayWorkerSelector> {
+    anyhow::bail!(
+        "custom worker-selection policy {instance:?} is not supported by this replay build \
+         (enable the dynamo-mocker `custom-policy` feature)"
+    );
 }
 
 pub(crate) fn replay_router_config(
@@ -170,10 +245,46 @@ worker_selection:
             Err(error) => error,
             Ok(_) => panic!("replay must reject a custom worker selector it cannot execute"),
         };
-        assert!(
-            error
-                .to_string()
-                .contains("custom worker-selection policy \"custom\" is not supported by replay")
-        );
+        let message = error.to_string();
+        if cfg!(feature = "custom-policy") {
+            // The registry is consulted: an unregistered type is the error.
+            assert!(message.contains("test"), "{message}");
+        } else {
+            assert!(
+                message.contains("custom worker-selection policy \"custom\" is not supported"),
+                "{message}"
+            );
+        }
+    }
+
+    #[cfg(feature = "custom-policy")]
+    #[test]
+    fn replay_selector_builds_a_shipped_policy() {
+        let policy_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            policy_file.path(),
+            r#"
+worker_selection:
+  aggregated: two-tier
+  instances:
+    - name: two-tier
+      type: dynamo-two-tier-cost-fn
+      parameters:
+        cache_threshold: 0.5
+"#,
+        )
+        .unwrap();
+        let config = KvRouterConfig {
+            router_policy_config: Some(policy_file.path().display().to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            replay_selector(&config).unwrap(),
+            ReplayWorkerSelector::Policy(_)
+        ));
+        assert!(matches!(
+            replay_selector(&KvRouterConfig::default()).unwrap(),
+            ReplayWorkerSelector::Default(_)
+        ));
     }
 }

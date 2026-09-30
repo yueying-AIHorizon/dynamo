@@ -22,7 +22,7 @@ use dynamo_kv_router::scheduling::{
 };
 use dynamo_kv_router::sequences::topology::WorkerDpRange;
 use dynamo_kv_router::{
-    ActiveSequencesMultiWorker, DefaultWorkerSelector, RadixTree, RoutingPartitionRef,
+    ActiveSequencesMultiWorker, RadixTree, RoutingPartitionRef,
     SchedulingRequest, SequenceRequest, SessionContext, TrackingHashAlgorithm, TrackingHashContext,
     TrackingHashScope, WorkerLoadProjection, WorkerSelectionInput, WorkerSelector,
     scheduling::TierOverlapBlocks,
@@ -37,7 +37,8 @@ use crate::common::protocols::MockEngineArgs;
 use crate::replay::ReplayPrefillLoadEstimator;
 use crate::replay::offline::extensions::kv_events::RouterEventBatch;
 use crate::replay::router_shared::{
-    ReplayNoopPublisher, ReplayWorkerConfig, replay_router_config, replay_selector_with_seed,
+    ReplayNoopPublisher, ReplayWorkerConfig, ReplayWorkerSelector, replay_router_config,
+    replay_selector_with_seed,
     replay_slots, replay_worker_config, replay_workers_with_configs,
 };
 use aisimulate_core::replay::loadgen::{ReplayRequestHashes, ReplayRequestPayload};
@@ -331,7 +332,7 @@ pub(crate) struct OfflineReplayRouter {
     worker_config_template: ReplayWorkerConfig,
     workers_with_configs: HashMap<WorkerId, ReplayWorkerConfig>,
     slots: Arc<ActiveSequencesMultiWorker<ReplayNoopPublisher>>,
-    selector: DefaultWorkerSelector,
+    selector: ReplayWorkerSelector,
     pending: PolicyQueue<PendingRequest>,
     indexer: SyncReplayIndexer,
     prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
