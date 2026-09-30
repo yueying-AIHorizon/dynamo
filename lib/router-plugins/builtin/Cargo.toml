@@ -13,6 +13,9 @@ description = "Worker-selection policies Dynamo ships and always links"
 
 [dependencies]
 dynamo-kv-router = { workspace = true, features = ["standalone-selection"] }
+# Tie-breaking, to match the built-in selector. Not behind a feature because dynamo-kv-router
+# already links it, so gating it here would not let any build drop it.
+fastrand = "2"
 serde.workspace = true
 
 [dev-dependencies]

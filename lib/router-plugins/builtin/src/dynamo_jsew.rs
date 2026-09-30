@@ -1,0 +1,742 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Job-size-aware effective work (JSEW) worker selection.
+//!
+//! Dynamo's built-in selector charges decode load as *footprint*: the KV blocks a worker's active
+//! requests currently occupy. On long-context agentic traces footprint is a poor proxy for the
+//! *work* those requests still owe. A 300k-token prompt that emits 24 tokens occupies an enormous
+//! footprint while costing almost no decode work; a 45k prompt that emits 60k tokens pins a worker
+//! for minutes on a modest footprint. Routing on footprint therefore steers new requests away from
+//! workers that are nearly done and toward workers that are about to generate for a long time,
+//! which shows up as tail end-to-end latency.
+//!
+//! This policy reproduces the built-in cost exactly and rescales only its decode term:
+//!
+//! ```text
+//! decode_term = decode_footprint_weight * decode_blocks
+//!             + decode_work_scale * (predicted_decode_blocks / request_blocks) * decode_blocks
+//! ```
+//!
+//! `decode_footprint_weight` retains the stock footprint belief and `decode_work_scale` adds the
+//! predicted-work belief, normalized by the incoming request's own size so the term is a
+//! dimensionless ratio. `decode_footprint_weight: 1.0` with `decode_work_scale: 0.0` reproduces the
+//! built-in selector's decision exactly.
+//!
+//! Two predictors supply `predicted_decode_blocks`:
+//!
+//! - `ema_uncached_tokens` (default) tracks an exponential moving average of the *uncached* prompt
+//!   tokens the router has already placed. It uses only what the router legitimately knows at
+//!   admission time, so it is deployable.
+//! - `ground_truth_future_decode` reads the caller-declared `expected_output_tokens`, falling back
+//!   to the EMA when absent. In replay that is the recorded output length, making it an oracle
+//!   upper bound on what any predictor can reach.
+//!
+//! The belief is resolved once per request rather than once per candidate: the EMA is stateful, so
+//! folding it per candidate would make the prediction depend on how many workers happen to be
+//! eligible.
+
+use std::sync::Arc;
+
+use dynamo_kv_router::services::selection::{
+    WorkerSelectionPolicyFactory, WorkerSelectionPolicyParameters,
+    WorkerSelectionPolicyProviderError, WorkerSelectionPolicyRegistry,
+    WorkerSelectionPolicyRegistryError,
+};
+use dynamo_kv_router::{
+    KvRouterConfig, ScoredWorkerCandidate, WorkerCacheInput, WorkerInputView, WorkerInputs,
+    WorkerLoadInput, WorkerPicker, WorkerSelectionContext, WorkerSelectionPolicy,
+    WorkerSelectionPolicyError,
+};
+
+/// Policy type selected by `worker_selection.instances[].type`.
+pub const POLICY_TYPE: &str = "dynamo-jsew";
+
+/// Defaults tuned on the `cc_agent_1200` agentic trace.
+const DEFAULT_DECODE_WORK_SCALE: f64 = 8.55;
+const DEFAULT_DECODE_FOOTPRINT_WEIGHT: f64 = 1.0;
+const DEFAULT_EMA_ALPHA: f64 = 0.02;
+
+/// Which belief supplies the predicted remaining decode work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EffectiveWorkPredictor {
+    /// Exponential moving average over the uncached prompt tokens already routed.
+    #[default]
+    EmaUncachedTokens,
+    /// The caller-declared `expected_output_tokens`, falling back to the EMA when absent.
+    GroundTruthFutureDecode,
+}
+
+/// Tunables for [`POLICY_TYPE`].
+///
+/// Every field is optional and keeps the tuned default when omitted. Unknown keys are rejected at
+/// startup rather than ignored, so a misremembered name fails loudly.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct Parameters {
+    /// Which belief supplies the predicted remaining decode work.
+    effective_work_predictor: EffectiveWorkPredictor,
+    /// Weight on the predicted-work term, relative to the request's own block count. `0.0`
+    /// disables the hypothesis and leaves the stock footprint belief in charge.
+    decode_work_scale: f64,
+    /// Weight retained on the stock decode-footprint term. `1.0` keeps it whole.
+    decode_footprint_weight: f64,
+    /// Smoothing factor for the EMA, in `(0, 1]`. `1.0` degenerates to "last routed request".
+    ema_alpha: f64,
+}
+
+impl Default for Parameters {
+    fn default() -> Self {
+        Self {
+            effective_work_predictor: EffectiveWorkPredictor::default(),
+            decode_work_scale: DEFAULT_DECODE_WORK_SCALE,
+            decode_footprint_weight: DEFAULT_DECODE_FOOTPRINT_WEIGHT,
+            ema_alpha: DEFAULT_EMA_ALPHA,
+        }
+    }
+}
+
+impl Parameters {
+    fn validate(&self) -> Result<(), WorkerSelectionPolicyProviderError> {
+        if !self.decode_work_scale.is_finite() || !(0.0..=20.0).contains(&self.decode_work_scale) {
+            return Err(WorkerSelectionPolicyProviderError::new(
+                "decode_work_scale must be a finite number between 0.0 and 20.0",
+            ));
+        }
+        if !self.decode_footprint_weight.is_finite()
+            || !(0.0..=2.0).contains(&self.decode_footprint_weight)
+        {
+            return Err(WorkerSelectionPolicyProviderError::new(
+                "decode_footprint_weight must be a finite number between 0.0 and 2.0",
+            ));
+        }
+        if !self.ema_alpha.is_finite() || self.ema_alpha <= 0.0 || self.ema_alpha > 1.0 {
+            return Err(WorkerSelectionPolicyProviderError::new(
+                "ema_alpha must be a finite number in (0.0, 1.0]",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Cross-request belief for the EMA predictor.
+///
+/// Seeded from the first observation rather than from zero, so the very first requests are not
+/// routed against a belief that no traffic has informed.
+#[derive(Debug, Default)]
+struct EmaBelief {
+    uncached_tokens: Option<f64>,
+}
+
+impl EmaBelief {
+    fn observe(&mut self, uncached_tokens: f64, alpha: f64) -> f64 {
+        let updated = match self.uncached_tokens {
+            Some(previous) => alpha * uncached_tokens + (1.0 - alpha) * previous,
+            None => uncached_tokens,
+        };
+        self.uncached_tokens = Some(updated);
+        updated
+    }
+}
+
+/// The decode-cost rescaling this policy applies, resolved once per request.
+#[derive(Debug, Clone, Copy)]
+struct DecodeWorkBelief {
+    predicted_decode_blocks: f64,
+    decode_work_scale: f64,
+    decode_footprint_weight: f64,
+}
+
+impl DecodeWorkBelief {
+    fn decode_cost_blocks(self, decode_cost_blocks: f64, request_blocks: u64) -> f64 {
+        let ratio = self.predicted_decode_blocks / request_blocks.max(1) as f64;
+        self.decode_footprint_weight * decode_cost_blocks
+            + self.decode_work_scale * ratio * decode_cost_blocks
+    }
+}
+
+/// Reproduce the built-in selector's per-worker logit, rescaling only its decode term.
+///
+/// Every input here is read from the host so the two costs stay in lockstep: any drift would make
+/// a probe measure this re-implementation rather than the decode-work hypothesis.
+#[allow(clippy::too_many_arguments)]
+fn worker_logit(
+    config: &KvRouterConfig,
+    context: &WorkerSelectionContext<'_>,
+    worker_label: &str,
+    belief: DecodeWorkBelief,
+    cache: &WorkerCacheInput,
+    load: &WorkerLoadInput,
+    min_active_prefill_tokens: usize,
+    reports_tier_overlap: bool,
+) -> f64 {
+    let overlap_score_credit = context.overlap_score_credit();
+    let overlap_score_credit_decay = context.overlap_score_credit_decay();
+
+    // Without a per-tier breakdown the host reports zero device blocks and the built-in selector
+    // credits the tier-weighted total instead.
+    let device_overlap_blocks = if reports_tier_overlap {
+        cache.device_overlap_blocks()
+    } else {
+        cache.effective_overlap_blocks()
+    };
+
+    // Normalize backlog above the least-loaded eligible worker by this request's size. The
+    // rational decay softly trades cache locality for prefill balance, while leaving workers at
+    // the load floor with their full device credit.
+    let overlap_credit_decay =
+        if context.tracks_prefill_tokens() && overlap_score_credit_decay > 0.0 {
+            let excess_active_prefill_blocks = load
+                .active_prefill_tokens()
+                .saturating_sub(min_active_prefill_tokens)
+                as f64
+                / context.block_size() as f64;
+            let normalized_prefill_load =
+                excess_active_prefill_blocks / context.request_blocks() as f64;
+            1.0 / (1.0 + overlap_score_credit_decay * normalized_prefill_load)
+        } else {
+            1.0
+        };
+
+    let overlap_credit_blocks = overlap_score_credit * overlap_credit_decay * device_overlap_blocks
+        + config.host_cache_hit_weight * cache.host_overlap_blocks()
+        + config.disk_cache_hit_weight * cache.disk_overlap_blocks()
+        + context.shared_cache_multiplier() * cache.shared_beyond_device_blocks() as f64;
+
+    // The only departure from the built-in cost.
+    let decode_cost_blocks =
+        belief.decode_cost_blocks(load.decode_cost_blocks(), context.request_blocks());
+    let active_request_cost_blocks =
+        config.decode_active_request_weight * load.active_requests() as f64;
+
+    // Decode routers normally force `overlap_score_credit=0`, which preserves load-only disagg
+    // routing. When conditional disagg leaves a positive credit in place, the built-in selector
+    // prefers cache-hot decode workers while still charging decode backlog.
+    if worker_label == "decode" && !context.tracks_prefill_tokens() && overlap_score_credit > 0.0 {
+        // Clamped at zero for the same reason the built-in selector clamps: downstream taint
+        // multipliers assume non-negative scores.
+        return (decode_cost_blocks - overlap_credit_blocks).max(0.0) + active_request_cost_blocks;
+    }
+
+    let adjusted_prefill_blocks = (load.raw_prefill_blocks() - overlap_credit_blocks).max(0.0);
+    context.prefill_load_scale() * adjusted_prefill_blocks
+        + decode_cost_blocks
+        + active_request_cost_blocks
+}
+
+/// Sample a row from the cost distribution the built-in selector would sample at `temperature`.
+fn softmax_sample_row(costs: &[f64], temperature: f64, sample: f64) -> usize {
+    let (min_cost, max_cost) = costs
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), cost| {
+            (lo.min(*cost), hi.max(*cost))
+        });
+
+    let mut probabilities = Vec::with_capacity(costs.len());
+    if min_cost == max_cost {
+        probabilities.resize(costs.len(), 1.0 / costs.len() as f64);
+    } else {
+        let range = max_cost - min_cost;
+        let magnitude = if range.is_finite() {
+            1.0
+        } else {
+            min_cost.abs().max(max_cost.abs())
+        };
+        let min_normalized = min_cost / magnitude;
+        let scale = -1.0 / ((max_cost / magnitude - min_normalized) * temperature);
+        let max_scaled = min_normalized * scale;
+        probabilities.extend(
+            costs
+                .iter()
+                .map(|cost| (cost / magnitude * scale - max_scaled).exp()),
+        );
+    }
+
+    let sum: f64 = probabilities.iter().sum();
+    let mut cumulative = 0.0;
+    for (row, probability) in probabilities.iter().enumerate() {
+        cumulative += probability / sum;
+        if sample <= cumulative {
+            return row;
+        }
+    }
+    costs.len() - 1
+}
+
+struct JsewPicker {
+    config: KvRouterConfig,
+    worker_label: &'static str,
+    parameters: Parameters,
+    belief: EmaBelief,
+    costs: Vec<f64>,
+}
+
+impl JsewPicker {
+    /// Resolve the decode-work belief for one request.
+    ///
+    /// `best_cached_tokens` is the longest prompt prefix any eligible worker can skip, so
+    /// `isl_tokens` minus it is the uncached prompt this request actually pays for.
+    fn resolve_belief(
+        &mut self,
+        context: &WorkerSelectionContext<'_>,
+        best_cached_tokens: usize,
+    ) -> DecodeWorkBelief {
+        let uncached_tokens = context.isl_tokens().saturating_sub(best_cached_tokens) as f64;
+        let predicted_decode_tokens = match self.parameters.effective_work_predictor {
+            EffectiveWorkPredictor::GroundTruthFutureDecode => context
+                .expected_output_tokens()
+                .map(f64::from)
+                // Still fold the observation so the fallback belief stays current.
+                .map(|declared| {
+                    self.belief
+                        .observe(uncached_tokens, self.parameters.ema_alpha);
+                    declared
+                })
+                .unwrap_or_else(|| {
+                    self.belief
+                        .observe(uncached_tokens, self.parameters.ema_alpha)
+                }),
+            EffectiveWorkPredictor::EmaUncachedTokens => self
+                .belief
+                .observe(uncached_tokens, self.parameters.ema_alpha),
+        };
+        DecodeWorkBelief {
+            predicted_decode_blocks: predicted_decode_tokens
+                / f64::from(context.block_size().max(1)),
+            decode_work_scale: self.parameters.decode_work_scale,
+            decode_footprint_weight: self.parameters.decode_footprint_weight,
+        }
+    }
+}
+
+impl WorkerPicker for JsewPicker {
+    fn required_worker_inputs(&self) -> WorkerInputs {
+        WorkerInputs::CACHE | WorkerInputs::LOAD | WorkerInputs::PREFERRED_TAINT
+    }
+
+    fn pick(
+        &mut self,
+        context: &WorkerSelectionContext<'_>,
+        input: WorkerInputView<'_>,
+    ) -> Result<usize, WorkerSelectionPolicyError> {
+        let candidates = input.candidates();
+        let cache = input
+            .cache()
+            .ok_or_else(|| WorkerSelectionPolicyError::failed("cache input unavailable"))?;
+        let load = input
+            .load()
+            .ok_or_else(|| WorkerSelectionPolicyError::failed("load input unavailable"))?;
+        if candidates.is_empty() || cache.len() != candidates.len() || load.len() != candidates.len()
+        {
+            return Err(WorkerSelectionPolicyError::failed("no eligible worker"));
+        }
+
+        let reports_tier_overlap = context.reports_tier_overlap_blocks();
+        let block_size = f64::from(context.block_size());
+        // The host derives cached tokens from the same rounding, so this recovers the value the
+        // built-in selector's predictor observes.
+        let best_cached_tokens = cache
+            .iter()
+            .map(|item| {
+                let effective = if reports_tier_overlap {
+                    item.device_overlap_blocks()
+                        + self.config.host_cache_hit_weight * item.host_overlap_blocks()
+                        + self.config.disk_cache_hit_weight * item.disk_overlap_blocks()
+                } else {
+                    item.effective_overlap_blocks()
+                };
+                (effective * block_size).round().max(0.0) as usize
+            })
+            .max()
+            .unwrap_or(0);
+        let belief = self.resolve_belief(context, best_cached_tokens);
+
+        let min_active_prefill_tokens =
+            if context.tracks_prefill_tokens() && context.overlap_score_credit_decay() > 0.0 {
+                load.iter()
+                    .map(WorkerLoadInput::active_prefill_tokens)
+                    .min()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+
+        self.costs.clear();
+        self.costs
+            .extend(candidates.iter().zip(cache).zip(load).map(
+                |((candidate, cache), load): ((&ScoredWorkerCandidate, _), _)| {
+                    let logit = worker_logit(
+                        &self.config,
+                        context,
+                        self.worker_label,
+                        belief,
+                        cache,
+                        load,
+                        min_active_prefill_tokens,
+                        reports_tier_overlap,
+                    );
+                    match candidate.preferred_taint_multiplier() {
+                        // Matches the built-in selector's multiplicative bias, which assumes a
+                        // non-negative score.
+                        Some(multiplier) => logit * multiplier,
+                        None => logit,
+                    }
+                },
+            ));
+
+        let temperature = context
+            .router_temperature_override()
+            .unwrap_or(self.config.router_temperature);
+        if temperature != 0.0 {
+            return Ok(softmax_sample_row(&self.costs, temperature, fastrand::f64()));
+        }
+
+        // Break ties uniformly, as the built-in selector does, so equal-cost workers do not all
+        // collapse onto whichever row the host happened to emit first.
+        let mut best_row = 0;
+        let mut best_cost = f64::INFINITY;
+        let mut tie_count = 0;
+        for (row, &cost) in self.costs.iter().enumerate() {
+            if cost < best_cost {
+                best_row = row;
+                best_cost = cost;
+                tie_count = 1;
+            } else if cost == best_cost {
+                tie_count += 1;
+                if fastrand::usize(0..tie_count) == 0 {
+                    best_row = row;
+                }
+            }
+        }
+        Ok(best_row)
+    }
+}
+
+fn provider(
+    parameters: &WorkerSelectionPolicyParameters,
+) -> Result<WorkerSelectionPolicyFactory, WorkerSelectionPolicyProviderError> {
+    let parameters: Parameters = parameters.deserialize()?;
+    parameters.validate()?;
+
+    Ok(Arc::new(
+        move |config: &KvRouterConfig, worker_type, _partition| {
+            // The built-in selector distinguishes only prefill pools from all others, and this
+            // policy reproduces its cost, so it must label pools the same way.
+            let worker_label = dynamo_kv_router::WorkerType::default_selector_label(&worker_type);
+            WorkerSelectionPolicy::new(
+                config.clone(),
+                worker_label,
+                Vec::new(),
+                Box::new(JsewPicker {
+                    config: config.clone(),
+                    worker_label,
+                    parameters,
+                    belief: EmaBelief::default(),
+                    costs: Vec::new(),
+                }),
+            )
+        },
+    ))
+}
+
+pub fn register(
+    registry: &mut WorkerSelectionPolicyRegistry,
+) -> Result<(), WorkerSelectionPolicyRegistryError> {
+    registry.register(POLICY_TYPE, Arc::new(provider))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use dynamo_kv_router::protocols::{RoutingConstraints, WorkerConfigLike, WorkerWithDpRank};
+    use dynamo_kv_router::scheduling::{OverlapSignals, ScheduleMode};
+    use dynamo_kv_router::{
+        DefaultWorkerSelector, SchedulingRequest, WorkerLoadProjection, WorkerSelectionInput,
+        WorkerSelector,
+    };
+
+    use super::*;
+
+    const BLOCK_SIZE: u32 = 16;
+    /// Ten blocks of prompt.
+    const TEN_BLOCKS: usize = 160;
+    const A: u64 = 29;
+    const B: u64 = 41;
+
+    struct TestWorker;
+
+    impl WorkerConfigLike for TestWorker {
+        fn data_parallel_start_rank(&self) -> u32 {
+            0
+        }
+        fn data_parallel_size(&self) -> u32 {
+            1
+        }
+        fn max_num_batched_tokens(&self) -> Option<u64> {
+            None
+        }
+        fn total_kv_blocks(&self) -> Option<u64> {
+            Some(1_000_000)
+        }
+    }
+
+    fn worker(id: u64) -> WorkerWithDpRank {
+        WorkerWithDpRank::from_worker_id(id)
+    }
+
+    /// One worker's signals: `(worker_id, overlap_blocks, active_decode_blocks)`.
+    type WorkerSpec = (u64, usize, usize);
+
+    fn request(workers: [WorkerSpec; 2], expected_output_tokens: Option<u32>) -> SchedulingRequest {
+        let mut request = SchedulingRequest {
+            mode: ScheduleMode::QueryOnly { request_id: None },
+            token_seq: None,
+            isl_tokens: TEN_BLOCKS,
+            lora_name: None,
+            expected_output_tokens,
+            affinity_target: None,
+            pinned_worker: None,
+            allowed_worker_ids: None,
+            routing_constraints: RoutingConstraints::default(),
+            router_config_override: None,
+            track_prefill_tokens: true,
+            priority_jump: 0.0,
+            strict_priority: 0,
+            policy_class: None,
+            session_context: None,
+            overlap: OverlapSignals::default(),
+            kv_transfer_candidates: None,
+            retain_kv_transfer_chain: false,
+            shared_cache_hits: None,
+            worker_loads: Default::default(),
+            resp_tx: None,
+        };
+        for (id, overlap_blocks, active_decode_blocks) in workers {
+            // Offline replay reports no per-tier breakdown, only the weighted total.
+            request
+                .overlap
+                .effective_overlap_blocks
+                .insert(worker(id), overlap_blocks as f64);
+            request
+                .overlap
+                .effective_cached_tokens
+                .insert(worker(id), overlap_blocks * BLOCK_SIZE as usize);
+            request.worker_loads.insert(
+                worker(id),
+                WorkerLoadProjection {
+                    active_decode_blocks,
+                    ..Default::default()
+                },
+            );
+        }
+        request
+    }
+
+    fn configs(workers: [WorkerSpec; 2]) -> HashMap<u64, TestWorker> {
+        HashMap::from(workers.map(|(id, _, _)| (id, TestWorker)))
+    }
+
+    /// Route one request through this policy and return the worker it picks.
+    fn select_with(parameters: Parameters, workers: [WorkerSpec; 2]) -> WorkerWithDpRank {
+        select_seq(parameters, [workers], None)[0]
+    }
+
+    /// Route a sequence of requests through one policy instance, so the EMA carries across them.
+    fn select_seq<const N: usize>(
+        parameters: Parameters,
+        requests: [[WorkerSpec; 2]; N],
+        expected_output_tokens: Option<u32>,
+    ) -> Vec<WorkerWithDpRank> {
+        let config = KvRouterConfig::default();
+        let policy = WorkerSelectionPolicy::new(
+            config.clone(),
+            "decode",
+            Vec::new(),
+            Box::new(JsewPicker {
+                config,
+                worker_label: "decode",
+                parameters,
+                belief: EmaBelief::default(),
+                costs: Vec::new(),
+            }),
+        );
+        requests
+            .into_iter()
+            .map(|workers| {
+                let request = request(workers, expected_output_tokens);
+                let configs = configs(workers);
+                policy
+                    .select_worker(WorkerSelectionInput::configured(
+                        &configs,
+                        &request,
+                        request.eligibility(),
+                        BLOCK_SIZE,
+                    ))
+                    .unwrap()
+                    .worker
+            })
+            .collect()
+    }
+
+    /// Route the same request through Dynamo's built-in selector.
+    fn select_stock(workers: [WorkerSpec; 2]) -> WorkerWithDpRank {
+        let request = request(workers, None);
+        let configs = configs(workers);
+        DefaultWorkerSelector::new(Some(KvRouterConfig::default()), "decode")
+            .select_worker(WorkerSelectionInput::configured(
+                &configs,
+                &request,
+                request.eligibility(),
+                BLOCK_SIZE,
+            ))
+            .unwrap()
+            .worker
+    }
+
+    /// Neutral parameters: keep the stock footprint term whole, add nothing on top.
+    fn neutral() -> Parameters {
+        Parameters {
+            decode_work_scale: 0.0,
+            decode_footprint_weight: 1.0,
+            ..Parameters::default()
+        }
+    }
+
+    #[test]
+    fn registers_its_policy_type() {
+        let mut registry = WorkerSelectionPolicyRegistry::default();
+        register(&mut registry).unwrap();
+        assert_eq!(POLICY_TYPE, "dynamo-jsew");
+        // Re-registering the same type is what a duplicated catalog entry would do.
+        assert!(register(&mut registry).is_err());
+    }
+
+    #[test]
+    fn neutral_parameters_reproduce_the_built_in_choice() {
+        // Cases where cache overlap and decode footprint disagree, so any drift in the ported cost
+        // would show up as a different worker.
+        for workers in [
+            [(A, 0, 0), (B, 8, 40)],
+            [(A, 6, 30), (B, 0, 0)],
+            [(A, 10, 100), (B, 2, 5)],
+            [(A, 3, 12), (B, 4, 20)],
+            [(A, 0, 7), (B, 5, 9)],
+        ] {
+            assert_eq!(
+                select_with(neutral(), workers),
+                select_stock(workers),
+                "diverged from the built-in selector on {workers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn predicted_work_outweighs_cache_affinity() {
+        // B holds five of the request's ten blocks but carries more decode backlog than A. Stock
+        // cache credit outweighs those four extra decode blocks, and the neutral policy agrees.
+        let workers = [(A, 0, 30), (B, 5, 34)];
+        assert_eq!(select_with(neutral(), workers), worker(B));
+
+        // Scaling the predicted-work term amplifies the decode gap until it swamps the five blocks
+        // of cache credit, so the request goes to the worker that owes less work.
+        let tuned = Parameters {
+            decode_work_scale: 20.0,
+            ..neutral()
+        };
+        assert_eq!(select_with(tuned, workers), worker(A));
+    }
+
+    #[test]
+    fn dropping_the_footprint_weight_restores_cache_affinity() {
+        // With the footprint term whole, A's empty decode queue outweighs B's full cache hit.
+        let workers = [(A, 0, 0), (B, 10, 12)];
+        assert_eq!(select_with(neutral(), workers), worker(A));
+
+        // Discarding the footprint belief leaves only prefill load, so the cache hit decides.
+        let tuned = Parameters {
+            decode_footprint_weight: 0.0,
+            decode_work_scale: 0.0,
+            ..Parameters::default()
+        };
+        assert_eq!(select_with(tuned, workers), worker(B));
+    }
+
+    #[test]
+    fn the_ema_belief_carries_across_requests() {
+        // One request, routed twice against identical worker state but different prior traffic.
+        let request = [(A, 0, 30), (B, 5, 34)];
+        // Fully cached: this warm-up owes almost no prefill, so it teaches the EMA that traffic is
+        // cheap.
+        let warm_cache = [(A, 10, 0), (B, 10, 0)];
+        // Fully uncached: the same warm-up shape, but it teaches the EMA that traffic is expensive.
+        let cold_cache = [(A, 0, 0), (B, 0, 0)];
+
+        // The tuned EMA is slow enough that one request cannot move it, so the warm-up decides
+        // what the policy believes the next request's neighbours owe.
+        let parameters = Parameters {
+            decode_work_scale: 20.0,
+            ..Parameters::default()
+        };
+
+        // After cheap traffic the predicted-work term stays small and cache credit decides.
+        assert_eq!(
+            select_seq(parameters, [warm_cache, request], None)[1],
+            worker(B)
+        );
+        // After expensive traffic the same term dominates, and the request avoids B's backlog.
+        assert_eq!(
+            select_seq(parameters, [cold_cache, request], None)[1],
+            worker(A)
+        );
+    }
+
+    #[test]
+    fn ground_truth_predictor_reads_the_declared_output_length() {
+        let workers = [(A, 0, 30), (B, 5, 34)];
+        let ground_truth = Parameters {
+            effective_work_predictor: EffectiveWorkPredictor::GroundTruthFutureDecode,
+            decode_work_scale: 20.0,
+            ..Parameters::default()
+        };
+
+        // A short declared completion leaves the predicted-work term small, so cache credit wins.
+        assert_eq!(select_seq(ground_truth, [workers], Some(1))[0], worker(B));
+        // A long one charges decode backlog hard enough to flip the choice.
+        assert_eq!(
+            select_seq(ground_truth, [workers], Some(100_000))[0],
+            worker(A)
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_parameters() {
+        let scale = |v| {
+            Parameters {
+                decode_work_scale: v,
+                ..Default::default()
+            }
+            .validate()
+        };
+        let footprint = |v| {
+            Parameters {
+                decode_footprint_weight: v,
+                ..Default::default()
+            }
+            .validate()
+        };
+        let alpha = |v| {
+            Parameters {
+                ema_alpha: v,
+                ..Default::default()
+            }
+            .validate()
+        };
+
+        assert!(scale(-0.1).is_err() && scale(20.1).is_err() && scale(f64::NAN).is_err());
+        assert!(footprint(-0.1).is_err() && footprint(2.1).is_err());
+        assert!(alpha(0.0).is_err() && alpha(1.1).is_err() && alpha(f64::NAN).is_err());
+        assert!(Parameters::default().validate().is_ok());
+    }
+}
