@@ -62,6 +62,14 @@ pub const POLICY_TYPE: &str = "dynamo-jsew";
 /// decode work a typical arrival owes, which is what the routing decision actually needs.
 /// `decode_footprint_weight: 1.7` then overweights the stock footprint belief relative to the
 /// prefill term, which keeps the large-footprint workers from re-accumulating backlog.
+///
+/// Treat these as a set, not as three independently adjustable dials. The objective surface around
+/// them is not a smooth bowl: what moves the tail is whether a handful of very long sessions land
+/// on distinct workers, which is a discrete outcome, so the metric steps rather than slopes.
+/// `(16.5, 1.8, 0.004)` and `(17.0, 1.8, 0.0038)` reach the identical routing and score within
+/// 1e-5, while `(17.0, 1.7, 0.0038)` -- one knob nudged by 5% -- gives back most of the gain.
+/// Re-tune the triple jointly against a target trace rather than hand-adjusting one value, and
+/// confirm any candidate across several seeds, since neighbouring settings can be bimodal.
 const DEFAULT_DECODE_WORK_SCALE: f64 = 17.0;
 const DEFAULT_DECODE_FOOTPRINT_WEIGHT: f64 = 1.7;
 const DEFAULT_EMA_ALPHA: f64 = 0.004;
