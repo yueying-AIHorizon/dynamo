@@ -339,6 +339,10 @@ impl KvRouterConfig {
             conditional_disagg_prefill_busy_threshold,
             conditional_disagg_decode_busy_threshold,
             router_predicted_ttl_secs,
+            // Policy knobs that have no Python-constructor argument (e.g. the
+            // jsew_* scoring fields) keep their KvRouterConfig defaults; they are
+            // reachable through the JSON/YAML path (`KvRouterConfig.from_json`).
+            ..RsKvRouterConfig::default()
         };
         validate_kv_router_config(&inner)?;
         Ok(KvRouterConfig { inner })
