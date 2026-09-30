@@ -2106,6 +2106,7 @@ name = "dynamo-custom-policy-builtin"
 version = "1.5.0"
 dependencies = [
  "dynamo-kv-router",
+ "fastrand",
  "serde",
 ]
 
