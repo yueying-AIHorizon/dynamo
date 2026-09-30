@@ -166,6 +166,46 @@ impl WorkerSelectionContext<'_> {
         self.block_size
     }
 
+    /// Return the incoming prompt size in tokens.
+    ///
+    /// [`Self::request_blocks`] rounds this up to whole blocks, so a policy that needs the exact
+    /// prompt length cannot recover it from the block count.
+    pub fn isl_tokens(&self) -> usize {
+        self.request.isl_tokens
+    }
+
+    /// Return whether the request carries a per-tier overlap breakdown.
+    ///
+    /// When false, [`WorkerCacheInput::device_overlap_blocks`] is zero for every candidate and the
+    /// built-in selector credits [`WorkerCacheInput::effective_overlap_blocks`] instead.
+    pub fn reports_tier_overlap_blocks(&self) -> bool {
+        let tiers = &self.request.overlap.tier_overlap_blocks;
+        !tiers.device.is_empty() || !tiers.host_pinned.is_empty() || !tiers.disk.is_empty()
+    }
+
+    /// Return the device-overlap credit multiplier in force for this request.
+    ///
+    /// This resolves the request-level override against the router config, so a policy that reads
+    /// it reproduces the same credit the built-in selector applies.
+    pub fn overlap_score_credit(&self) -> f64 {
+        self.weights.overlap_score_credit
+    }
+
+    /// Return the decay rate applied to device-overlap credit as prefill backlog rises.
+    pub fn overlap_score_credit_decay(&self) -> f64 {
+        self.weights.overlap_score_credit_decay
+    }
+
+    /// Return the prefill-load scale in force for this request, resolving any request override.
+    pub fn prefill_load_scale(&self) -> f64 {
+        self.weights.prefill_load_scale
+    }
+
+    /// Return the shared-cache credit multiplier in force for this request.
+    pub fn shared_cache_multiplier(&self) -> f64 {
+        self.weights.shared_cache_multiplier
+    }
+
     /// Return whether this request contributes to prefill-load tracking.
     pub fn tracks_prefill_tokens(&self) -> bool {
         self.track_prefill_tokens
@@ -284,6 +324,14 @@ impl ScoredWorkerCandidate {
 }
 
 impl WorkerCacheInput {
+    /// Return the tier-weighted prefix overlap in KV blocks.
+    ///
+    /// Device blocks count in full; lower tiers are weighted by their cache-hit weights. This is
+    /// the overlap the built-in selector credits when no per-tier breakdown is reported.
+    pub fn effective_overlap_blocks(&self) -> f64 {
+        self.effective_overlap_blocks
+    }
+
     /// Return device-resident prefix overlap in KV blocks.
     pub fn device_overlap_blocks(&self) -> f64 {
         self.device_overlap_blocks
@@ -306,6 +354,14 @@ impl WorkerCacheInput {
 }
 
 impl WorkerLoadInput {
+    /// Return this worker's projected prefill footprint in KV blocks if it admits this request,
+    /// before any overlap credit is subtracted.
+    ///
+    /// Zero when the request does not track prefill tokens.
+    pub fn raw_prefill_blocks(&self) -> f64 {
+        self.raw_prefill_blocks
+    }
+
     /// Return the tokens active in this worker's prefill stage.
     pub fn active_prefill_tokens(&self) -> usize {
         self.active_prefill_tokens
