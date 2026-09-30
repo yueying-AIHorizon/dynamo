@@ -53,9 +53,18 @@ use dynamo_kv_router::{
 pub const POLICY_TYPE: &str = "dynamo-jsew";
 
 /// Defaults tuned on the `cc_agent_1200` agentic trace.
-const DEFAULT_DECODE_WORK_SCALE: f64 = 8.55;
-const DEFAULT_DECODE_FOOTPRINT_WEIGHT: f64 = 1.0;
-const DEFAULT_EMA_ALPHA: f64 = 0.02;
+///
+/// The predicted-work term wants to be loud (`17.0`) and the belief that feeds it wants to be
+/// nearly static (`ema_alpha: 0.004`, a horizon of ~250 requests). That pairing is not a
+/// coincidence: on this trace the uncached-prompt signal is extremely heavy-tailed, so a
+/// responsive EMA tracks individual outliers and makes the decode charge lurch between requests.
+/// Averaging over the whole session instead turns the term into a stable estimate of how much
+/// decode work a typical arrival owes, which is what the routing decision actually needs.
+/// `decode_footprint_weight: 1.7` then overweights the stock footprint belief relative to the
+/// prefill term, which keeps the large-footprint workers from re-accumulating backlog.
+const DEFAULT_DECODE_WORK_SCALE: f64 = 17.0;
+const DEFAULT_DECODE_FOOTPRINT_WEIGHT: f64 = 1.7;
+const DEFAULT_EMA_ALPHA: f64 = 0.004;
 
 /// Which belief supplies the predicted remaining decode work.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
@@ -668,10 +677,11 @@ mod tests {
         let cold_cache = [(A, 0, 0), (B, 0, 0)];
 
         // The tuned EMA is slow enough that one request cannot move it, so the warm-up decides
-        // what the policy believes the next request's neighbours owe.
+        // what the policy believes the next request's neighbours owe. Built on the neutral
+        // footprint weight so this exercises the predicted-work term alone.
         let parameters = Parameters {
             decode_work_scale: 20.0,
-            ..Parameters::default()
+            ..neutral()
         };
 
         // After cheap traffic the predicted-work term stays small and cache credit decides.
@@ -692,7 +702,7 @@ mod tests {
         let ground_truth = Parameters {
             effective_work_predictor: EffectiveWorkPredictor::GroundTruthFutureDecode,
             decode_work_scale: 20.0,
-            ..Parameters::default()
+            ..neutral()
         };
 
         // A short declared completion leaves the predicted-work term small, so cache credit wins.
