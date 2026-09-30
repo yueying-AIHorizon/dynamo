@@ -505,6 +505,59 @@ impl RouterPrefillLoadModel {
     }
 }
 
+/// Which belief the join-shortest-expected-work (JSEW) router uses for the
+/// decode work each worker still owes.
+///
+/// The stock scorer charges `decode_cost_blocks`, which is a KV *footprint*
+/// (blocks resident) rather than remaining *work* (tokens still to generate).
+/// On long-context agentic traces those two diverge by orders of magnitude: a
+/// 300k-token prompt with a 24-token completion occupies an enormous footprint
+/// but costs almost no decode work, while a 45k prompt with 60k output tokens
+/// pins a worker for minutes. JSEW replaces the footprint belief with a
+/// predicted remaining-decode-token belief.
+///
+/// Inert unless [`KvRouterConfig::jsew_enabled`] is true.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveWorkPredictor {
+    /// Predict each admitted request's remaining decode tokens from an
+    /// exponential moving average over the *uncached* prompt tokens the router
+    /// has already routed. Uses only information the router legitimately has at
+    /// admission time (prompt length and cache overlap), so it is deployable.
+    #[default]
+    EmaUncachedTokens,
+    /// Use the caller-declared `expected_output_tokens` for each active request
+    /// as the remaining-decode-work belief. In replay this is the recorded
+    /// output length, so it is an oracle upper bound on what any predictor can
+    /// achieve; in production it is whatever the client declared via
+    /// `max_tokens`, which is a loose but real signal.
+    GroundTruthFutureDecode,
+}
+
+impl fmt::Display for EffectiveWorkPredictor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmaUncachedTokens => f.write_str("ema_uncached_tokens"),
+            Self::GroundTruthFutureDecode => f.write_str("ground_truth_future_decode"),
+        }
+    }
+}
+
+impl FromStr for EffectiveWorkPredictor {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "ema_uncached_tokens" => Ok(Self::EmaUncachedTokens),
+            "ground_truth_future_decode" => Ok(Self::GroundTruthFutureDecode),
+            _ => Err(format!(
+                "unknown effective work predictor: {s:?}, expected \
+                 'ema_uncached_tokens' or 'ground_truth_future_decode'"
+            )),
+        }
+    }
+}
+
 /// Which conditional-disagg bypass policy to run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -691,6 +744,12 @@ struct KvRouterConfigSerde {
     conditional_disagg_eff_isl_ratio_threshold: f64,
     conditional_disagg_prefill_busy_threshold: Option<f64>,
     conditional_disagg_decode_busy_threshold: Option<f64>,
+    jsew_enabled: bool,
+    effective_work_predictor: EffectiveWorkPredictor,
+    jsew_decode_work_scale: f64,
+    jsew_decode_footprint_weight: f64,
+    jsew_ema_alpha: f64,
+    jsew_ema_seed_tokens: f64,
 }
 
 impl Default for KvRouterConfigSerde {
@@ -738,6 +797,12 @@ impl Default for KvRouterConfigSerde {
                 .conditional_disagg_prefill_busy_threshold,
             conditional_disagg_decode_busy_threshold: config
                 .conditional_disagg_decode_busy_threshold,
+            jsew_enabled: config.jsew_enabled,
+            effective_work_predictor: config.effective_work_predictor,
+            jsew_decode_work_scale: config.jsew_decode_work_scale,
+            jsew_decode_footprint_weight: config.jsew_decode_footprint_weight,
+            jsew_ema_alpha: config.jsew_ema_alpha,
+            jsew_ema_seed_tokens: config.jsew_ema_seed_tokens,
         }
     }
 }
@@ -925,6 +990,90 @@ pub struct KvRouterConfig {
     /// the guard is disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditional_disagg_decode_busy_threshold: Option<f64>,
+
+    /// Master gate for join-shortest-expected-work (JSEW) routing.
+    ///
+    /// When false (the default) every `jsew_*` field below is inert and the
+    /// selector computes the stock logit bit-for-bit. When true, the decode
+    /// term of the worker logit is replaced by a blend of the stock KV
+    /// footprint and a predicted remaining-decode-work belief; see
+    /// [`EffectiveWorkPredictor`].
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub jsew_enabled: bool,
+
+    /// Which belief JSEW uses for each worker's remaining decode work.
+    /// Inert unless `jsew_enabled`.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub effective_work_predictor: EffectiveWorkPredictor,
+
+    /// Weight on the predicted remaining-decode-work term, in units of
+    /// cost-blocks per block-equivalent of predicted remaining decode tokens.
+    /// Must be finite and non-negative. Inert unless `jsew_enabled`.
+    #[serde(
+        default = "default_jsew_decode_work_scale",
+        skip_serializing_if = "is_default_jsew_decode_work_scale"
+    )]
+    pub jsew_decode_work_scale: f64,
+
+    /// Residual weight kept on the stock `decode_cost_blocks` footprint term
+    /// when JSEW is on. `1.0` keeps the stock term in full and only *adds* the
+    /// work belief; `0.0` replaces it outright. Must be in `[0, 1]`.
+    /// Inert unless `jsew_enabled`.
+    #[serde(
+        default = "default_jsew_decode_footprint_weight",
+        skip_serializing_if = "is_default_jsew_decode_footprint_weight"
+    )]
+    pub jsew_decode_footprint_weight: f64,
+
+    /// EMA smoothing factor for `ema_uncached_tokens`. Must be in `(0, 1]`;
+    /// `1.0` degenerates to "last routed request". Inert unless `jsew_enabled`
+    /// and the EMA predictor is selected.
+    #[serde(
+        default = "default_jsew_ema_alpha",
+        skip_serializing_if = "is_default_jsew_ema_alpha"
+    )]
+    pub jsew_ema_alpha: f64,
+
+    /// Initial EMA value, in tokens, before a worker has seen any request.
+    /// Must be finite and non-negative. Inert unless `jsew_enabled` and the
+    /// EMA predictor is selected.
+    #[serde(
+        default = "default_jsew_ema_seed_tokens",
+        skip_serializing_if = "is_default_jsew_ema_seed_tokens"
+    )]
+    pub jsew_ema_seed_tokens: f64,
+}
+
+const fn default_jsew_decode_work_scale() -> f64 {
+    8.55
+}
+
+const fn default_jsew_decode_footprint_weight() -> f64 {
+    1.0
+}
+
+const fn default_jsew_ema_alpha() -> f64 {
+    0.02
+}
+
+const fn default_jsew_ema_seed_tokens() -> f64 {
+    0.0
+}
+
+fn is_default_jsew_decode_work_scale(value: &f64) -> bool {
+    *value == default_jsew_decode_work_scale()
+}
+
+fn is_default_jsew_decode_footprint_weight(value: &f64) -> bool {
+    *value == default_jsew_decode_footprint_weight()
+}
+
+fn is_default_jsew_ema_alpha(value: &f64) -> bool {
+    *value == default_jsew_ema_alpha()
+}
+
+fn is_default_jsew_ema_seed_tokens(value: &f64) -> bool {
+    *value == default_jsew_ema_seed_tokens()
 }
 
 fn default_conditional_disagg_eff_isl_threshold() -> usize {
@@ -986,6 +1135,12 @@ impl Default for KvRouterConfig {
                 default_conditional_disagg_eff_isl_ratio_threshold(),
             conditional_disagg_prefill_busy_threshold: None,
             conditional_disagg_decode_busy_threshold: None,
+            jsew_enabled: false,
+            effective_work_predictor: EffectiveWorkPredictor::default(),
+            jsew_decode_work_scale: default_jsew_decode_work_scale(),
+            jsew_decode_footprint_weight: default_jsew_decode_footprint_weight(),
+            jsew_ema_alpha: default_jsew_ema_alpha(),
+            jsew_ema_seed_tokens: default_jsew_ema_seed_tokens(),
         }
     }
 }
@@ -1052,6 +1207,12 @@ impl TryFrom<KvRouterConfigSerde> for KvRouterConfig {
                 .conditional_disagg_prefill_busy_threshold,
             conditional_disagg_decode_busy_threshold: compat
                 .conditional_disagg_decode_busy_threshold,
+            jsew_enabled: compat.jsew_enabled,
+            effective_work_predictor: compat.effective_work_predictor,
+            jsew_decode_work_scale: compat.jsew_decode_work_scale,
+            jsew_decode_footprint_weight: compat.jsew_decode_footprint_weight,
+            jsew_ema_alpha: compat.jsew_ema_alpha,
+            jsew_ema_seed_tokens: compat.jsew_ema_seed_tokens,
         };
         config.validate()?;
         Ok(config)
@@ -1128,6 +1289,23 @@ fn validate_kv_router_config(config: &KvRouterConfig) -> Result<(), String> {
             decode_busy_threshold = threshold,
             "conditional_disagg decode-busy guard enabled: bypass is disabled when the selected decode worker's projected decode load exceeds this fraction of KV capacity"
         );
+    }
+    validate_min("jsew_decode_work_scale", config.jsew_decode_work_scale, 0.0)?;
+    if !config.jsew_decode_work_scale.is_finite() {
+        return Err("jsew_decode_work_scale must be finite".to_string());
+    }
+    validate_range(
+        "jsew_decode_footprint_weight",
+        config.jsew_decode_footprint_weight,
+        0.0,
+        1.0,
+    )?;
+    if config.jsew_ema_alpha <= 0.0 || config.jsew_ema_alpha > 1.0 {
+        return Err("jsew_ema_alpha must be in (0, 1]".to_string());
+    }
+    validate_min("jsew_ema_seed_tokens", config.jsew_ema_seed_tokens, 0.0)?;
+    if !config.jsew_ema_seed_tokens.is_finite() {
+        return Err("jsew_ema_seed_tokens must be finite".to_string());
     }
     if let Err(error) = config.loaded_policy_config() {
         return Err(format!("router_policy_config: {error}"));
