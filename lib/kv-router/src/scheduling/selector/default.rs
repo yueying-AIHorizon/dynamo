@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use super::jsew::{self, JsewEmaState, JsewPrediction};
 use super::policy::WorkerSelectionPolicyStateRef;
 use super::{
     LogitWeights, MaterializedSelectionInput, WorkerCandidate, WorkerInputs,
@@ -104,11 +105,17 @@ pub(super) struct DefaultWorkerScorer<C = KvRouterConfig> {
 struct DefaultScoringContext {
     min_active_prefill_tokens: usize,
     has_tier_overlap_blocks: bool,
+    /// Resolved once per selection in [`pick_default_worker`]. `None` whenever
+    /// `jsew_enabled` is false, which is the only state the stock logit sees.
+    jsew: Option<JsewPrediction>,
 }
 
 pub(super) struct DefaultWorkerPicker {
     // Preserve DefaultWorkerSelector's Sync contract. Zero-temperature selection never locks.
     softmax_scratch: Mutex<DefaultSoftmaxScratch>,
+    /// Cross-request belief for the JSEW EMA predictor. Never locked unless
+    /// `jsew_enabled` is true.
+    jsew_ema: JsewEmaState,
     #[cfg(any(test, feature = "bench"))]
     deterministic_rng: Option<Arc<Mutex<fastrand::Rng>>>,
 }
@@ -239,6 +246,19 @@ impl DefaultScoringContext {
         Self {
             min_active_prefill_tokens,
             has_tier_overlap_blocks,
+            // Populated by `pick_default_worker` only when JSEW is enabled; every
+            // other construction site keeps the stock `None`.
+            jsew: None,
+        }
+    }
+
+    /// Charge decode load the way the active predictor believes it should be
+    /// charged. With JSEW off this is the identity on `decode_cost_blocks`.
+    #[inline]
+    fn decode_cost_blocks(self, decode_cost_blocks: f64, request_blocks: u64) -> f64 {
+        match self.jsew {
+            Some(prediction) => prediction.decode_cost_blocks(decode_cost_blocks, request_blocks),
+            None => decode_cost_blocks,
         }
     }
 
@@ -306,7 +326,8 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
             + kv_router_config.host_cache_hit_weight * cache.host_overlap_blocks
             + kv_router_config.disk_cache_hit_weight * cache.disk_overlap_blocks
             + shared_overlap_blocks;
-        let decode_cost_blocks = load.decode_cost_blocks;
+        let decode_cost_blocks =
+            default_context.decode_cost_blocks(load.decode_cost_blocks, context.request_blocks);
         let active_request_cost_blocks =
             kv_router_config.decode_active_request_weight * load.active_requests as f64;
 
@@ -411,6 +432,28 @@ impl DefaultWorkerPicker {
     }
 }
 
+/// Largest effective cached-token count across the workers this request may
+/// land on, i.e. the prompt prefix it can hope to skip. `isl_tokens` minus this
+/// is the uncached prompt the EMA predictor observes.
+fn best_effective_cached_tokens<C: WorkerConfigLike>(
+    workers: &HashMap<WorkerId, C>,
+    request: &SchedulingRequest,
+    eligibility: RoutingEligibility<'_>,
+) -> usize {
+    let mut best = 0usize;
+    eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
+        best = best.max(
+            request
+                .overlap
+                .effective_cached_tokens
+                .get(&worker)
+                .copied()
+                .unwrap_or(0),
+        );
+    });
+    best
+}
+
 #[inline(always)]
 pub(super) fn pick_default_worker<C: WorkerConfigLike>(
     scorer: &DefaultWorkerScorer<&KvRouterConfig>,
@@ -420,8 +463,20 @@ pub(super) fn pick_default_worker<C: WorkerConfigLike>(
     request: &SchedulingRequest,
     eligibility: RoutingEligibility<'_>,
 ) -> Option<(WorkerWithDpRank, f64)> {
-    let default_context =
+    let mut default_context =
         DefaultScoringContext::new(workers, request, eligibility, input.context.weights);
+    // Resolve the belief once per request, not once per candidate: the EMA is
+    // stateful, so folding it per candidate would make the prediction depend on
+    // how many workers happen to be eligible.
+    if scorer.kv_router_config.jsew_enabled {
+        default_context.jsew = jsew::resolve_prediction(
+            scorer.kv_router_config,
+            request,
+            &picker.jsew_ema,
+            best_effective_cached_tokens(workers, request, eligibility),
+            input.context.block_size,
+        );
+    }
     if let Some(worker) = eligibility.pinned_worker() {
         let row = default_row(input, default_context, worker, None);
         return Some((
@@ -532,6 +587,7 @@ impl DefaultWorkerPicker {
     ) -> Self {
         Self {
             softmax_scratch: Mutex::default(),
+            jsew_ema: JsewEmaState::default(),
             #[cfg(any(test, feature = "bench"))]
             deterministic_rng,
         }
