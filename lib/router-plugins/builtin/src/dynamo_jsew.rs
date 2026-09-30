@@ -14,14 +14,31 @@
 //! This policy reproduces the built-in cost exactly and rescales only its decode term:
 //!
 //! ```text
-//! decode_term = decode_footprint_weight * decode_blocks
-//!             + decode_work_scale * (predicted_decode_blocks / request_blocks) * decode_blocks
+//! charged_blocks = decode_blocks * (decode_blocks / mean_decode_blocks) ^ (decode_load_exponent - 1)
+//! decode_term    = decode_footprint_weight * charged_blocks
+//!                + decode_work_scale * (predicted_decode_blocks / request_blocks) ^ decode_work_exponent
+//!                  * charged_blocks
 //! ```
 //!
 //! `decode_footprint_weight` retains the stock footprint belief and `decode_work_scale` adds the
 //! predicted-work belief, normalized by the incoming request's own size so the term is a
 //! dimensionless ratio. `decode_footprint_weight: 1.0` with `decode_work_scale: 0.0` reproduces the
 //! built-in selector's decision exactly.
+//!
+//! Two exponents shape the charge; both are neutral at `1.0`, where the expression above collapses
+//! to the linear form and the policy is bit-for-bit what it was without them.
+//!
+//! - `decode_work_exponent` bends the size ratio. The ratio's denominator is the incoming request's
+//!   own block count, so the term charges a short prompt far more per block of a worker's backlog
+//!   than a long one. The exponent sets how sharply that sensitivity falls off with prompt size,
+//!   which is a different question from how loud the term is overall (`decode_work_scale`).
+//! - `decode_load_exponent` bends the charge in the worker's own backlog. Decode step time does not
+//!   grow linearly in resident KV: past the batch size where the step goes memory-bound, another
+//!   long session costs the whole batch far more than the one before it. A convex charge (`> 1.0`)
+//!   makes the last increment of backlog on an already-loaded worker dominate, which is exactly the
+//!   "past the point where decode step time explodes" boundary this policy exists to respect.
+//!   Dividing by the candidate mean keeps the term's magnitude comparable to the prefill term it is
+//!   summed against, so bending the curve does not silently re-weight the whole cost.
 //!
 //! Two predictors supply `predicted_decode_blocks`:
 //!
@@ -73,6 +90,8 @@ pub const POLICY_TYPE: &str = "dynamo-jsew";
 const DEFAULT_DECODE_WORK_SCALE: f64 = 17.0;
 const DEFAULT_DECODE_FOOTPRINT_WEIGHT: f64 = 1.7;
 const DEFAULT_EMA_ALPHA: f64 = 0.004;
+const DEFAULT_DECODE_WORK_EXPONENT: f64 = 1.0;
+const DEFAULT_DECODE_LOAD_EXPONENT: f64 = 1.0;
 
 /// Which belief supplies the predicted remaining decode work.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
@@ -101,6 +120,12 @@ struct Parameters {
     decode_footprint_weight: f64,
     /// Smoothing factor for the EMA, in `(0, 1]`. `1.0` degenerates to "last routed request".
     ema_alpha: f64,
+    /// Exponent on the predicted-work-to-request-size ratio. `1.0` leaves the ratio linear;
+    /// below `1.0` flattens the term's sensitivity to prompt size, above `1.0` sharpens it.
+    decode_work_exponent: f64,
+    /// Exponent on the worker's decode backlog, normalized by the candidate mean. `1.0` charges
+    /// backlog linearly; above `1.0` charges an already-loaded worker superlinearly.
+    decode_load_exponent: f64,
 }
 
 impl Default for Parameters {
@@ -110,6 +135,8 @@ impl Default for Parameters {
             decode_work_scale: DEFAULT_DECODE_WORK_SCALE,
             decode_footprint_weight: DEFAULT_DECODE_FOOTPRINT_WEIGHT,
             ema_alpha: DEFAULT_EMA_ALPHA,
+            decode_work_exponent: DEFAULT_DECODE_WORK_EXPONENT,
+            decode_load_exponent: DEFAULT_DECODE_LOAD_EXPONENT,
         }
     }
 }
@@ -131,6 +158,22 @@ impl Parameters {
         if !self.ema_alpha.is_finite() || self.ema_alpha <= 0.0 || self.ema_alpha > 1.0 {
             return Err(WorkerSelectionPolicyProviderError::new(
                 "ema_alpha must be a finite number in (0.0, 1.0]",
+            ));
+        }
+        // Both exponents are bounded away from zero: an exponent of zero collapses its factor to a
+        // constant, which silently deletes the term rather than reshaping it.
+        if !self.decode_work_exponent.is_finite()
+            || !(0.1..=4.0).contains(&self.decode_work_exponent)
+        {
+            return Err(WorkerSelectionPolicyProviderError::new(
+                "decode_work_exponent must be a finite number between 0.1 and 4.0",
+            ));
+        }
+        if !self.decode_load_exponent.is_finite()
+            || !(0.1..=4.0).contains(&self.decode_load_exponent)
+        {
+            return Err(WorkerSelectionPolicyProviderError::new(
+                "decode_load_exponent must be a finite number between 0.1 and 4.0",
             ));
         }
         Ok(())
@@ -161,15 +204,42 @@ impl EmaBelief {
 #[derive(Debug, Clone, Copy)]
 struct DecodeWorkBelief {
     predicted_decode_blocks: f64,
+    mean_decode_blocks: f64,
     decode_work_scale: f64,
     decode_footprint_weight: f64,
+    decode_work_exponent: f64,
+    decode_load_exponent: f64,
 }
 
 impl DecodeWorkBelief {
+    /// Bend the worker's decode backlog around the candidate mean.
+    ///
+    /// Normalizing by the mean keeps the charge's magnitude comparable to the linear one at any
+    /// exponent, so `decode_load_exponent` reshapes which worker looks cheapest without also
+    /// re-weighting the decode term against the prefill term it is summed with.
+    fn charged_blocks(self, decode_cost_blocks: f64) -> f64 {
+        // An empty decode queue costs nothing at any exponent, and short-circuiting it keeps the
+        // `0 ^ negative` pole out of the normalization below.
+        if self.decode_load_exponent == 1.0
+            || decode_cost_blocks <= 0.0
+            || self.mean_decode_blocks <= 0.0
+        {
+            return decode_cost_blocks;
+        }
+        decode_cost_blocks
+            * (decode_cost_blocks / self.mean_decode_blocks).powf(self.decode_load_exponent - 1.0)
+    }
+
     fn decode_cost_blocks(self, decode_cost_blocks: f64, request_blocks: u64) -> f64 {
+        let charged_blocks = self.charged_blocks(decode_cost_blocks);
         let ratio = self.predicted_decode_blocks / request_blocks.max(1) as f64;
-        self.decode_footprint_weight * decode_cost_blocks
-            + self.decode_work_scale * ratio * decode_cost_blocks
+        let shaped_ratio = if self.decode_work_exponent == 1.0 {
+            ratio
+        } else {
+            ratio.powf(self.decode_work_exponent)
+        };
+        self.decode_footprint_weight * charged_blocks
+            + self.decode_work_scale * shaped_ratio * charged_blocks
     }
 }
 
@@ -298,6 +368,7 @@ impl JsewPicker {
         &mut self,
         context: &WorkerSelectionContext<'_>,
         best_cached_tokens: usize,
+        mean_decode_blocks: f64,
     ) -> DecodeWorkBelief {
         let uncached_tokens = context.isl_tokens().saturating_sub(best_cached_tokens) as f64;
         // Folded unconditionally so the EMA stays current even when the oracle supplies the
@@ -315,8 +386,11 @@ impl JsewPicker {
         DecodeWorkBelief {
             predicted_decode_blocks: predicted_decode_tokens
                 / f64::from(context.block_size().max(1)),
+            mean_decode_blocks,
             decode_work_scale: self.parameters.decode_work_scale,
             decode_footprint_weight: self.parameters.decode_footprint_weight,
+            decode_work_exponent: self.parameters.decode_work_exponent,
+            decode_load_exponent: self.parameters.decode_load_exponent,
         }
     }
 }
@@ -361,7 +435,18 @@ impl WorkerPicker for JsewPicker {
             })
             .max()
             .unwrap_or(0);
-        let belief = self.resolve_belief(context, best_cached_tokens);
+        // The reference point `decode_load_exponent` bends around. Taken over the eligible set for
+        // this request so the charge tracks how loaded the pool is right now, rather than against a
+        // fixed scale that would make the exponent's effect drift with overall traffic.
+        let mean_decode_blocks = if self.parameters.decode_load_exponent == 1.0 {
+            0.0
+        } else {
+            load.iter()
+                .map(WorkerLoadInput::decode_cost_blocks)
+                .sum::<f64>()
+                / load.len() as f64
+        };
+        let belief = self.resolve_belief(context, best_cached_tokens, mean_decode_blocks);
 
         let min_active_prefill_tokens =
             if context.tracks_prefill_tokens() && context.overlap_score_credit_decay() > 0.0 {
@@ -723,6 +808,78 @@ mod tests {
     }
 
     #[test]
+    fn a_convex_load_exponent_avoids_the_deeper_backlog() {
+        // A holds no cache and a small backlog; B holds half the prompt and three more blocks of
+        // backlog. Charged linearly, B's five blocks of cache credit cover those three blocks.
+        let workers = [(A, 0, 8), (B, 5, 11)];
+        assert_eq!(select_with(neutral(), workers), worker(B));
+
+        // Bending the charge in the worker's own backlog costs B's deeper queue disproportionately
+        // more than A's, which is enough to outweigh the cache hit.
+        let convex = Parameters {
+            decode_load_exponent: 3.0,
+            ..neutral()
+        };
+        assert_eq!(select_with(convex, workers), worker(A));
+    }
+
+    #[test]
+    fn the_work_exponent_reshapes_the_size_ratio() {
+        // B holds five of the request's ten blocks but owes four more blocks of decode. A half-
+        // cached warm-up leaves the EMA believing an arrival owes five blocks of work against this
+        // request's ten, so the size ratio sits at 0.5 -- the regime the exponent acts on.
+        let workers = [(A, 0, 30), (B, 5, 34)];
+        let warm_cache = [(A, 5, 0), (B, 5, 0)];
+
+        // Charged linearly, that half-strength work term still swamps B's cache credit.
+        let linear = Parameters {
+            decode_work_scale: 3.0,
+            ..neutral()
+        };
+        assert_eq!(select_seq(linear, [warm_cache, workers], None)[1], worker(A));
+
+        // Sharpening the exponent drives a sub-unit ratio toward zero, quieting the work term for
+        // requests larger than the believed arrival and handing the choice back to cache credit.
+        // The scale is untouched, so this is a change in shape, not in loudness.
+        let sharpened = Parameters {
+            decode_work_exponent: 4.0,
+            ..linear
+        };
+        assert_eq!(
+            select_seq(sharpened, [warm_cache, workers], None)[1],
+            worker(B)
+        );
+    }
+
+    #[test]
+    fn neutral_exponents_leave_the_charge_untouched() {
+        // The exponents are new knobs on a tuned policy, so their neutral value has to be exactly
+        // inert: every previously reachable decision must still be reachable at 1.0.
+        for workers in [
+            [(A, 0, 0), (B, 8, 40)],
+            [(A, 6, 30), (B, 0, 0)],
+            [(A, 10, 100), (B, 2, 5)],
+            [(A, 3, 12), (B, 4, 20)],
+            [(A, 0, 7), (B, 5, 9)],
+        ] {
+            let belief = DecodeWorkBelief {
+                predicted_decode_blocks: 37.0,
+                mean_decode_blocks: 22.0,
+                decode_work_scale: DEFAULT_DECODE_WORK_SCALE,
+                decode_footprint_weight: DEFAULT_DECODE_FOOTPRINT_WEIGHT,
+                decode_work_exponent: 1.0,
+                decode_load_exponent: 1.0,
+            };
+            for (_, _, decode_blocks) in workers {
+                let blocks = decode_blocks as f64;
+                let expected = DEFAULT_DECODE_FOOTPRINT_WEIGHT * blocks
+                    + DEFAULT_DECODE_WORK_SCALE * (37.0 / 10.0) * blocks;
+                assert_eq!(belief.decode_cost_blocks(blocks, 10), expected);
+            }
+        }
+    }
+
+    #[test]
     fn rejects_out_of_range_parameters() {
         let scale = |v| {
             Parameters {
@@ -746,9 +903,26 @@ mod tests {
             .validate()
         };
 
+        let work_exponent = |v| {
+            Parameters {
+                decode_work_exponent: v,
+                ..Default::default()
+            }
+            .validate()
+        };
+        let load_exponent = |v| {
+            Parameters {
+                decode_load_exponent: v,
+                ..Default::default()
+            }
+            .validate()
+        };
+
         assert!(scale(-0.1).is_err() && scale(20.1).is_err() && scale(f64::NAN).is_err());
         assert!(footprint(-0.1).is_err() && footprint(2.1).is_err());
         assert!(alpha(0.0).is_err() && alpha(1.1).is_err() && alpha(f64::NAN).is_err());
+        assert!(work_exponent(0.0).is_err() && work_exponent(4.1).is_err());
+        assert!(load_exponent(0.0).is_err() && load_exponent(f64::NAN).is_err());
         assert!(Parameters::default().validate().is_ok());
     }
 }
