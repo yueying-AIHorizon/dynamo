@@ -71,27 +71,33 @@ pub const POLICY_TYPE: &str = "dynamo-jsew";
 
 /// Defaults tuned on the `cc_agent_1200` agentic trace.
 ///
-/// The predicted-work term wants to be loud (`17.0`) and the belief that feeds it wants to be
+/// The predicted-work term wants to be loud (`19.0`) and the belief that feeds it wants to be
 /// nearly static (`ema_alpha: 0.004`, a horizon of ~250 requests). That pairing is not a
 /// coincidence: on this trace the uncached-prompt signal is extremely heavy-tailed, so a
 /// responsive EMA tracks individual outliers and makes the decode charge lurch between requests.
 /// Averaging over the whole session instead turns the term into a stable estimate of how much
 /// decode work a typical arrival owes, which is what the routing decision actually needs.
-/// `decode_footprint_weight: 1.7` then overweights the stock footprint belief relative to the
-/// prefill term, which keeps the large-footprint workers from re-accumulating backlog.
 ///
-/// Treat these as a set, not as three independently adjustable dials. The objective surface around
+/// `decode_load_exponent: 1.2` is the knob that moves the tail. Because the belief is nearly
+/// constant, the linear form of the term reduces to a fixed multiple of each worker's decode
+/// backlog, so it can only rank workers the stock cost already ranked the same way. Bending the
+/// charge in the backlog itself is a genuinely new ordering: a worker twice as deep as the pool
+/// mean is charged ~2.3x rather than 2x, so long sessions are pushed off the queues that are
+/// already accumulating them. `decode_footprint_weight: 1.4` is then the linear counterweight that
+/// keeps the convexity from over-draining lightly loaded workers.
+///
+/// Treat these as a set, not as four independently adjustable dials. The objective surface around
 /// them is not a smooth bowl: what moves the tail is whether a handful of very long sessions land
-/// on distinct workers, which is a discrete outcome, so the metric steps rather than slopes.
-/// `(16.5, 1.8, 0.004)` and `(17.0, 1.8, 0.0038)` reach the identical routing and score within
-/// 1e-5, while `(17.0, 1.7, 0.0038)` -- one knob nudged by 5% -- gives back most of the gain.
-/// Re-tune the triple jointly against a target trace rather than hand-adjusting one value, and
-/// confirm any candidate across several seeds, since neighbouring settings can be bimodal.
-const DEFAULT_DECODE_WORK_SCALE: f64 = 17.0;
-const DEFAULT_DECODE_FOOTPRINT_WEIGHT: f64 = 1.7;
+/// on distinct workers, which is a discrete outcome, so the metric steps rather than slopes. The
+/// exponent is the sharpest example -- at the previous `(17.0, 1.7, 0.004)` triple, a 1.2 exponent
+/// was *bimodal*, mixing two distinct outcomes across repeats of the same seed, and the neighbours
+/// at 1.21 and 1.22 were stable but worse. Re-tune the whole set jointly against a target trace
+/// rather than hand-adjusting one value, and confirm any candidate across several seeds.
+const DEFAULT_DECODE_WORK_SCALE: f64 = 19.0;
+const DEFAULT_DECODE_FOOTPRINT_WEIGHT: f64 = 1.4;
 const DEFAULT_EMA_ALPHA: f64 = 0.004;
 const DEFAULT_DECODE_WORK_EXPONENT: f64 = 1.0;
-const DEFAULT_DECODE_LOAD_EXPONENT: f64 = 1.0;
+const DEFAULT_DECODE_LOAD_EXPONENT: f64 = 1.2;
 
 /// Which belief supplies the predicted remaining decode work.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
@@ -692,10 +698,15 @@ mod tests {
     }
 
     /// Neutral parameters: keep the stock footprint term whole, add nothing on top.
+    ///
+    /// The exponents are pinned to 1.0 rather than inherited, since the tuned default bends the
+    /// charge and neutrality here means "identical to the stock cost", not "the shipped setting".
     fn neutral() -> Parameters {
         Parameters {
             decode_work_scale: 0.0,
             decode_footprint_weight: 1.0,
+            decode_work_exponent: 1.0,
+            decode_load_exponent: 1.0,
             ..Parameters::default()
         }
     }
