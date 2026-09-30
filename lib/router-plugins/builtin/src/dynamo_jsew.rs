@@ -283,23 +283,17 @@ impl JsewPicker {
         best_cached_tokens: usize,
     ) -> DecodeWorkBelief {
         let uncached_tokens = context.isl_tokens().saturating_sub(best_cached_tokens) as f64;
+        // Folded unconditionally so the EMA stays current even when the oracle supplies the
+        // prediction, keeping the fallback usable for requests that declare no output length.
+        let ema_tokens = self
+            .belief
+            .observe(uncached_tokens, self.parameters.ema_alpha);
         let predicted_decode_tokens = match self.parameters.effective_work_predictor {
             EffectiveWorkPredictor::GroundTruthFutureDecode => context
                 .expected_output_tokens()
                 .map(f64::from)
-                // Still fold the observation so the fallback belief stays current.
-                .map(|declared| {
-                    self.belief
-                        .observe(uncached_tokens, self.parameters.ema_alpha);
-                    declared
-                })
-                .unwrap_or_else(|| {
-                    self.belief
-                        .observe(uncached_tokens, self.parameters.ema_alpha)
-                }),
-            EffectiveWorkPredictor::EmaUncachedTokens => self
-                .belief
-                .observe(uncached_tokens, self.parameters.ema_alpha),
+                .unwrap_or(ema_tokens),
+            EffectiveWorkPredictor::EmaUncachedTokens => ema_tokens,
         };
         DecodeWorkBelief {
             predicted_decode_blocks: predicted_decode_tokens
