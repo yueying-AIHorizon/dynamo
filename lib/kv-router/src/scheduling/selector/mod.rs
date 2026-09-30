@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 mod default;
+mod jsew;
 mod policy;
 
 pub use default::DefaultWorkerSelector;
