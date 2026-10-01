@@ -78,20 +78,23 @@ pub const POLICY_TYPE: &str = "dynamo-jsew";
 
 /// Defaults tuned on the `cc_agent_1200` agentic trace.
 ///
-/// The predicted-work term wants to be loud (`20.0`) and the belief that feeds it wants to be
-/// nearly static (`ema_alpha: 0.004`, a horizon of ~250 requests). That pairing is not a
-/// coincidence: on this trace the uncached-prompt signal is extremely heavy-tailed, so a
-/// responsive EMA tracks individual outliers and makes the decode charge lurch between requests.
-/// Averaging over the whole session instead turns the term into a stable estimate of how much
-/// decode work a typical arrival owes, which is what the routing decision actually needs.
+/// The predicted-work term wants to be loud (`17.6`) and the belief that feeds it wants to be
+/// slow (`ema_alpha: 0.017`, a horizon of ~60 requests). That pairing is not a coincidence: on this
+/// trace the uncached-prompt signal is extremely heavy-tailed, so a responsive EMA tracks
+/// individual outliers and makes the decode charge lurch between requests. Averaging over many
+/// requests instead turns the term into a stable estimate of how much decode work a typical
+/// arrival owes, which is what the routing decision actually needs. The horizon is ~4x shorter
+/// than it was before `decode_share_exponent` existed: once the pile-up the share term corrects is
+/// priced directly, the predicted-work term no longer has to stand in for it, so the belief is free
+/// to track the recent arrival mix rather than smoothing over the whole session.
 ///
 /// `decode_load_exponent: 1.2` is the knob that moves the tail. Because the belief is nearly
 /// constant, the linear form of the term reduces to a fixed multiple of each worker's decode
 /// backlog, so it can only rank workers the stock cost already ranked the same way. Bending the
 /// charge in the backlog itself is a genuinely new ordering: a worker twice as deep as the pool
 /// mean is charged ~2.3x rather than 2x, so long sessions are pushed off the queues that are
-/// already accumulating them. `decode_footprint_weight: 1.4` is then the linear counterweight that
-/// keeps the convexity from over-draining lightly loaded workers.
+/// already accumulating them. `decode_footprint_weight: 1.526` is then the linear counterweight
+/// that keeps the convexity from over-draining lightly loaded workers.
 ///
 /// Treat these as a set, not as four independently adjustable dials. The objective surface around
 /// them is not a smooth bowl: what moves the tail is whether a handful of very long sessions land
@@ -99,7 +102,9 @@ pub const POLICY_TYPE: &str = "dynamo-jsew";
 /// exponent is the sharpest example -- at the previous `(17.0, 1.7, 0.004)` triple, a 1.2 exponent
 /// was *bimodal*, mixing two distinct outcomes across repeats of the same seed, and the neighbours
 /// at 1.21 and 1.22 were stable but worse. Re-tune the whole set jointly against a target trace
-/// rather than hand-adjusting one value, and confirm any candidate across several seeds.
+/// rather than hand-adjusting one value, and confirm any candidate across several seeds. Both
+/// exponents were re-probed after `decode_share_exponent` landed and both held their previous
+/// values, so the share correction is close to orthogonal to the two curvature knobs.
 ///
 /// `decode_share_exponent: 0.13` is deliberately far below the `1.0` that the units argument alone
 /// would suggest. Un-sharing the footprint is a correction to a *reported* quantity, and the
@@ -123,9 +128,9 @@ pub const POLICY_TYPE: &str = "dynamo-jsew";
 /// with the exponent and breaches above ~0.18. `0.13` takes nearly all of the available gain while
 /// leaving ~9% TTFT headroom, which is the margin that survives a seed change -- 0.17 measured as a
 /// breach at four seeds even though its neighbours at 0.16 and 0.18 did not.
-const DEFAULT_DECODE_WORK_SCALE: f64 = 19.0;
-const DEFAULT_DECODE_FOOTPRINT_WEIGHT: f64 = 1.4;
-const DEFAULT_EMA_ALPHA: f64 = 0.004;
+const DEFAULT_DECODE_WORK_SCALE: f64 = 17.601;
+const DEFAULT_DECODE_FOOTPRINT_WEIGHT: f64 = 1.526;
+const DEFAULT_EMA_ALPHA: f64 = 0.01737;
 const DEFAULT_DECODE_WORK_EXPONENT: f64 = 1.0;
 const DEFAULT_DECODE_LOAD_EXPONENT: f64 = 1.2;
 const DEFAULT_DECODE_SHARE_EXPONENT: f64 = 0.13;
