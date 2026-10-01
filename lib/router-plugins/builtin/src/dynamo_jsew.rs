@@ -14,10 +14,11 @@
 //! This policy reproduces the built-in cost exactly and rescales only its decode term:
 //!
 //! ```text
-//! charged_blocks = decode_blocks * (decode_blocks / mean_decode_blocks) ^ (decode_load_exponent - 1)
-//! decode_term    = decode_footprint_weight * charged_blocks
-//!                + decode_work_scale * (predicted_decode_blocks / request_blocks) ^ decode_work_exponent
-//!                  * charged_blocks
+//! unshared_blocks = decode_blocks * active_requests ^ decode_share_exponent
+//! charged_blocks  = unshared_blocks * (unshared_blocks / mean_unshared_blocks) ^ (decode_load_exponent - 1)
+//! decode_term     = decode_footprint_weight * charged_blocks
+//!                 + decode_work_scale * (predicted_decode_blocks / request_blocks) ^ decode_work_exponent
+//!                   * charged_blocks
 //! ```
 //!
 //! `decode_footprint_weight` retains the stock footprint belief and `decode_work_scale` adds the
@@ -39,6 +40,12 @@
 //!   "past the point where decode step time explodes" boundary this policy exists to respect.
 //!   Dividing by the candidate mean keeps the term's magnitude comparable to the prefill term it is
 //!   summed against, so bending the curve does not silently re-weight the whole cost.
+//! - `decode_share_exponent` (neutral at `0.0`) corrects a units mismatch upstream of both. The
+//!   reported decode footprint counts physically resident blocks, which deduplicates the prefix
+//!   that sibling sessions share; decode step time instead scales with the sum of their logical
+//!   context lengths. A worker holding several sharing sessions therefore under-reports its load by
+//!   roughly that count, and cache-affinity routing sends it more of exactly those sessions. This
+//!   factor charges the un-shared sum back.
 //!
 //! Two predictors supply `predicted_decode_blocks`:
 //!
@@ -98,6 +105,7 @@ const DEFAULT_DECODE_FOOTPRINT_WEIGHT: f64 = 1.4;
 const DEFAULT_EMA_ALPHA: f64 = 0.004;
 const DEFAULT_DECODE_WORK_EXPONENT: f64 = 1.0;
 const DEFAULT_DECODE_LOAD_EXPONENT: f64 = 1.2;
+const DEFAULT_DECODE_SHARE_EXPONENT: f64 = 0.0;
 
 /// Which belief supplies the predicted remaining decode work.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
@@ -132,6 +140,9 @@ struct Parameters {
     /// Exponent on the worker's decode backlog, normalized by the candidate mean. `1.0` charges
     /// backlog linearly; above `1.0` charges an already-loaded worker superlinearly.
     decode_load_exponent: f64,
+    /// Exponent on the worker's active-request count, which un-shares the deduplicated decode
+    /// footprint. `0.0` leaves the footprint as reported.
+    decode_share_exponent: f64,
 }
 
 impl Default for Parameters {
@@ -143,6 +154,7 @@ impl Default for Parameters {
             ema_alpha: DEFAULT_EMA_ALPHA,
             decode_work_exponent: DEFAULT_DECODE_WORK_EXPONENT,
             decode_load_exponent: DEFAULT_DECODE_LOAD_EXPONENT,
+            decode_share_exponent: DEFAULT_DECODE_SHARE_EXPONENT,
         }
     }
 }
@@ -182,6 +194,15 @@ impl Parameters {
                 "decode_load_exponent must be a finite number between 0.1 and 4.0",
             ));
         }
+        // Zero is the neutral value here, not a degenerate one: it leaves the reported footprint
+        // untouched rather than deleting a factor.
+        if !self.decode_share_exponent.is_finite()
+            || !(0.0..=2.0).contains(&self.decode_share_exponent)
+        {
+            return Err(WorkerSelectionPolicyProviderError::new(
+                "decode_share_exponent must be a finite number between 0.0 and 2.0",
+            ));
+        }
         Ok(())
     }
 }
@@ -215,6 +236,7 @@ struct DecodeWorkBelief {
     decode_footprint_weight: f64,
     decode_work_exponent: f64,
     decode_load_exponent: f64,
+    decode_share_exponent: f64,
 }
 
 impl DecodeWorkBelief {
@@ -236,7 +258,29 @@ impl DecodeWorkBelief {
             * (decode_cost_blocks / self.mean_decode_blocks).powf(self.decode_load_exponent - 1.0)
     }
 
-    fn decode_cost_blocks(self, decode_cost_blocks: f64, request_blocks: u64) -> f64 {
+    /// Undo the deduplication in the reported decode footprint.
+    ///
+    /// `decode_cost_blocks` counts *physically resident* blocks, so sessions sharing a prefix are
+    /// counted once no matter how many of them are decoding. Decode step time is driven by the sum
+    /// of their *logical* context lengths instead, which is the shared prefix counted once per
+    /// session. A worker holding `n` sharing sessions therefore reports roughly `1/n` of the load
+    /// it actually imposes, and the stock cost routes yet more of them onto it -- the pile-up this
+    /// policy exists to prevent. Scaling by `active_requests ^ decode_share_exponent` recovers that
+    /// factor: `0.0` trusts the reported footprint, `1.0` charges the fully un-shared sum.
+    fn unshared_blocks(self, decode_cost_blocks: f64, active_requests: usize) -> f64 {
+        if self.decode_share_exponent == 0.0 || decode_cost_blocks <= 0.0 {
+            return decode_cost_blocks;
+        }
+        decode_cost_blocks * (active_requests.max(1) as f64).powf(self.decode_share_exponent)
+    }
+
+    fn decode_cost_blocks(
+        self,
+        decode_cost_blocks: f64,
+        request_blocks: u64,
+        active_requests: usize,
+    ) -> f64 {
+        let decode_cost_blocks = self.unshared_blocks(decode_cost_blocks, active_requests);
         let charged_blocks = self.charged_blocks(decode_cost_blocks);
         let ratio = self.predicted_decode_blocks / request_blocks.max(1) as f64;
         let shaped_ratio = if self.decode_work_exponent == 1.0 {
@@ -298,8 +342,11 @@ fn worker_logit(
         + context.shared_cache_multiplier() * cache.shared_beyond_device_blocks() as f64;
 
     // The only departure from the built-in cost.
-    let decode_cost_blocks =
-        belief.decode_cost_blocks(load.decode_cost_blocks(), context.request_blocks());
+    let decode_cost_blocks = belief.decode_cost_blocks(
+        load.decode_cost_blocks(),
+        context.request_blocks(),
+        load.active_requests(),
+    );
     let active_request_cost_blocks =
         config.decode_active_request_weight * load.active_requests() as f64;
 
@@ -397,6 +444,7 @@ impl JsewPicker {
             decode_footprint_weight: self.parameters.decode_footprint_weight,
             decode_work_exponent: self.parameters.decode_work_exponent,
             decode_load_exponent: self.parameters.decode_load_exponent,
+            decode_share_exponent: self.parameters.decode_share_exponent,
         }
     }
 }
@@ -444,11 +492,23 @@ impl WorkerPicker for JsewPicker {
         // The reference point `decode_load_exponent` bends around. Taken over the eligible set for
         // this request so the charge tracks how loaded the pool is right now, rather than against a
         // fixed scale that would make the exponent's effect drift with overall traffic.
+        //
+        // Taken over the un-shared blocks, since that is the quantity `charged_blocks` bends: a
+        // mean on the reported scale would make the normalization drift with how much prefix
+        // sharing the pool happens to hold.
+        let share_exponent = self.parameters.decode_share_exponent;
         let mean_decode_blocks = if self.parameters.decode_load_exponent == 1.0 {
             0.0
         } else {
             load.iter()
-                .map(WorkerLoadInput::decode_cost_blocks)
+                .map(|load| {
+                    let blocks = load.decode_cost_blocks();
+                    if share_exponent == 0.0 || blocks <= 0.0 {
+                        blocks
+                    } else {
+                        blocks * (load.active_requests().max(1) as f64).powf(share_exponent)
+                    }
+                })
                 .sum::<f64>()
                 / load.len() as f64
         };
@@ -590,8 +650,19 @@ mod tests {
 
     /// One worker's signals: `(worker_id, overlap_blocks, active_decode_blocks)`.
     type WorkerSpec = (u64, usize, usize);
+    /// As [`WorkerSpec`], plus the worker's active request count.
+    type SharedWorkerSpec = (u64, usize, usize, usize);
 
-    fn request(workers: [WorkerSpec; 2], expected_output_tokens: Option<u32>) -> SchedulingRequest {
+    /// Widen a [`WorkerSpec`] to one active request per worker, which is what the stock cost
+    /// assumes when it charges a deduplicated footprint.
+    fn unshared(workers: [WorkerSpec; 2]) -> [SharedWorkerSpec; 2] {
+        workers.map(|(id, overlap, decode)| (id, overlap, decode, 1))
+    }
+
+    fn request(
+        workers: [SharedWorkerSpec; 2],
+        expected_output_tokens: Option<u32>,
+    ) -> SchedulingRequest {
         let mut request = SchedulingRequest {
             mode: ScheduleMode::QueryOnly { request_id: None },
             token_seq: None,
@@ -615,7 +686,7 @@ mod tests {
             worker_loads: Default::default(),
             resp_tx: None,
         };
-        for (id, overlap_blocks, active_decode_blocks) in workers {
+        for (id, overlap_blocks, active_decode_blocks, active_requests) in workers {
             // Offline replay reports no per-tier breakdown, only the weighted total.
             request
                 .overlap
@@ -629,6 +700,7 @@ mod tests {
                 worker(id),
                 WorkerLoadProjection {
                     active_decode_blocks,
+                    active_requests,
                     ..Default::default()
                 },
             );
@@ -636,19 +708,19 @@ mod tests {
         request
     }
 
-    fn configs(workers: [WorkerSpec; 2]) -> HashMap<u64, TestWorker> {
-        HashMap::from(workers.map(|(id, _, _)| (id, TestWorker)))
+    fn configs(workers: [SharedWorkerSpec; 2]) -> HashMap<u64, TestWorker> {
+        HashMap::from(workers.map(|(id, _, _, _)| (id, TestWorker)))
     }
 
     /// Route one request through this policy and return the worker it picks.
     fn select_with(parameters: Parameters, workers: [WorkerSpec; 2]) -> WorkerWithDpRank {
-        select_seq(parameters, [workers], None)[0]
+        select_seq(parameters, [unshared(workers)], None)[0]
     }
 
     /// Route a sequence of requests through one policy instance, so the EMA carries across them.
     fn select_seq<const N: usize>(
         parameters: Parameters,
-        requests: [[WorkerSpec; 2]; N],
+        requests: [[SharedWorkerSpec; 2]; N],
         expected_output_tokens: Option<u32>,
     ) -> Vec<WorkerWithDpRank> {
         let config = KvRouterConfig::default();
@@ -684,6 +756,7 @@ mod tests {
 
     /// Route the same request through Dynamo's built-in selector.
     fn select_stock(workers: [WorkerSpec; 2]) -> WorkerWithDpRank {
+        let workers = unshared(workers);
         let request = request(workers, None);
         let configs = configs(workers);
         DefaultWorkerSelector::new(Some(KvRouterConfig::default()), "decode")
@@ -790,12 +863,12 @@ mod tests {
 
         // After cheap traffic the predicted-work term stays small and cache credit decides.
         assert_eq!(
-            select_seq(parameters, [warm_cache, request], None)[1],
+            select_seq(parameters, [unshared(warm_cache), unshared(request)], None)[1],
             worker(B)
         );
         // After expensive traffic the same term dominates, and the request avoids B's backlog.
         assert_eq!(
-            select_seq(parameters, [cold_cache, request], None)[1],
+            select_seq(parameters, [unshared(cold_cache), unshared(request)], None)[1],
             worker(A)
         );
     }
@@ -810,10 +883,10 @@ mod tests {
         };
 
         // A short declared completion leaves the predicted-work term small, so cache credit wins.
-        assert_eq!(select_seq(ground_truth, [workers], Some(1))[0], worker(B));
+        assert_eq!(select_seq(ground_truth, [unshared(workers)], Some(1))[0], worker(B));
         // A long one charges decode backlog hard enough to flip the choice.
         assert_eq!(
-            select_seq(ground_truth, [workers], Some(100_000))[0],
+            select_seq(ground_truth, [unshared(workers)], Some(100_000))[0],
             worker(A)
         );
     }
@@ -847,7 +920,7 @@ mod tests {
             decode_work_scale: 3.0,
             ..neutral()
         };
-        assert_eq!(select_seq(linear, [warm_cache, workers], None)[1], worker(A));
+        assert_eq!(select_seq(linear, [unshared(warm_cache), unshared(workers)], None)[1], worker(A));
 
         // Sharpening the exponent drives a sub-unit ratio toward zero, quieting the work term for
         // requests larger than the believed arrival and handing the choice back to cache credit.
@@ -857,7 +930,7 @@ mod tests {
             ..linear
         };
         assert_eq!(
-            select_seq(sharpened, [warm_cache, workers], None)[1],
+            select_seq(sharpened, [unshared(warm_cache), unshared(workers)], None)[1],
             worker(B)
         );
     }
@@ -880,14 +953,46 @@ mod tests {
                 decode_footprint_weight: DEFAULT_DECODE_FOOTPRINT_WEIGHT,
                 decode_work_exponent: 1.0,
                 decode_load_exponent: 1.0,
+                decode_share_exponent: 0.0,
             };
             for (_, _, decode_blocks) in workers {
                 let blocks = decode_blocks as f64;
                 let expected = DEFAULT_DECODE_FOOTPRINT_WEIGHT * blocks
                     + DEFAULT_DECODE_WORK_SCALE * (37.0 / 10.0) * blocks;
-                assert_eq!(belief.decode_cost_blocks(blocks, 10), expected);
+                // Any active-request count, since the share exponent is inert at 0.0.
+                for active_requests in [0, 1, 7] {
+                    assert_eq!(
+                        belief.decode_cost_blocks(blocks, 10, active_requests),
+                        expected
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn the_share_exponent_un_shares_a_deduplicated_footprint() {
+        // Both workers report the same decode footprint, but B's is the deduplicated total of six
+        // sessions sharing a prefix while A's belongs to a single session. B also holds half this
+        // request's prompt, so cache credit sends the request to B on the reported numbers.
+        let workers: [SharedWorkerSpec; 2] = [(A, 0, 20, 1), (B, 5, 20, 6)];
+        let neutral = Parameters {
+            decode_work_scale: 0.0,
+            decode_footprint_weight: 1.0,
+            decode_work_exponent: 1.0,
+            decode_load_exponent: 1.0,
+            decode_share_exponent: 0.0,
+            ..Parameters::default()
+        };
+        assert_eq!(select_seq(neutral, [workers], None)[0], worker(B));
+
+        // Charging the un-shared sum reveals that B's six sessions each carry that prefix through
+        // every decode step, so the request avoids piling a seventh onto it.
+        let unshare = Parameters {
+            decode_share_exponent: 1.0,
+            ..neutral
+        };
+        assert_eq!(select_seq(unshare, [workers], None)[0], worker(A));
     }
 
     #[test]
@@ -932,8 +1037,19 @@ mod tests {
         assert!(scale(-0.1).is_err() && scale(20.1).is_err() && scale(f64::NAN).is_err());
         assert!(footprint(-0.1).is_err() && footprint(2.1).is_err());
         assert!(alpha(0.0).is_err() && alpha(1.1).is_err() && alpha(f64::NAN).is_err());
+        let share_exponent = |v| {
+            Parameters {
+                decode_share_exponent: v,
+                ..Default::default()
+            }
+            .validate()
+        };
+
         assert!(work_exponent(0.0).is_err() && work_exponent(4.1).is_err());
         assert!(load_exponent(0.0).is_err() && load_exponent(f64::NAN).is_err());
+        // Zero is the share exponent's neutral value, so it must be accepted.
+        assert!(share_exponent(0.0).is_ok());
+        assert!(share_exponent(-0.1).is_err() && share_exponent(2.1).is_err());
         assert!(Parameters::default().validate().is_ok());
     }
 }
