@@ -71,7 +71,7 @@ pub const POLICY_TYPE: &str = "dynamo-jsew";
 
 /// Defaults tuned on the `cc_agent_1200` agentic trace.
 ///
-/// The predicted-work term wants to be loud (`19.0`) and the belief that feeds it wants to be
+/// The predicted-work term wants to be loud (`20.0`) and the belief that feeds it wants to be
 /// nearly static (`ema_alpha: 0.004`, a horizon of ~250 requests). That pairing is not a
 /// coincidence: on this trace the uncached-prompt signal is extremely heavy-tailed, so a
 /// responsive EMA tracks individual outliers and makes the decode charge lurch between requests.
