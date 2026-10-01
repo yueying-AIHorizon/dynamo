@@ -100,12 +100,35 @@ pub const POLICY_TYPE: &str = "dynamo-jsew";
 /// was *bimodal*, mixing two distinct outcomes across repeats of the same seed, and the neighbours
 /// at 1.21 and 1.22 were stable but worse. Re-tune the whole set jointly against a target trace
 /// rather than hand-adjusting one value, and confirm any candidate across several seeds.
+///
+/// `decode_share_exponent: 0.13` is deliberately far below the `1.0` that the units argument alone
+/// would suggest. Un-sharing the footprint is a correction to a *reported* quantity, and the
+/// reported quantity is not uniformly wrong: `active_requests` counts every decoding session on the
+/// worker, but only the ones that actually share a prefix are under-counted, and only for the
+/// shared part of their context. Charging the full `active_requests` factor therefore overshoots
+/// badly -- it turns the decode term into a request-count penalty that fights cache affinity
+/// everywhere instead of only where sharing hides load. Measured on the target trace at 8 seeds, a
+/// fractional exponent is both better and safer than a full one:
+///
+/// ```text
+/// share exp   objective   p99 TTFT (limit 4281.9)   output tok/s
+///      0.00     0.89475                    3741.7         2265.4
+///      0.13     0.67857                    3903.1         2468.4
+///      0.18     0.67414                    4128.1         2445.1
+///      1.00     0.74563                    5330.4         2129.0
+/// ```
+///
+/// The objective is flat from 0.12 to 0.18 and the binding constraint is prefill latency: pushing
+/// decode work off the cache-warm worker forces recomputation, so p99 TTFT climbs monotonically
+/// with the exponent and breaches above ~0.18. `0.13` takes nearly all of the available gain while
+/// leaving ~9% TTFT headroom, which is the margin that survives a seed change -- 0.17 measured as a
+/// breach at four seeds even though its neighbours at 0.16 and 0.18 did not.
 const DEFAULT_DECODE_WORK_SCALE: f64 = 19.0;
 const DEFAULT_DECODE_FOOTPRINT_WEIGHT: f64 = 1.4;
 const DEFAULT_EMA_ALPHA: f64 = 0.004;
 const DEFAULT_DECODE_WORK_EXPONENT: f64 = 1.0;
 const DEFAULT_DECODE_LOAD_EXPONENT: f64 = 1.2;
-const DEFAULT_DECODE_SHARE_EXPONENT: f64 = 0.0;
+const DEFAULT_DECODE_SHARE_EXPONENT: f64 = 0.13;
 
 /// Which belief supplies the predicted remaining decode work.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
