@@ -352,11 +352,10 @@ fn worker_logit(
     // the load floor with their full device credit.
     let overlap_credit_decay =
         if context.tracks_prefill_tokens() && overlap_score_credit_decay > 0.0 {
-            let excess_active_prefill_blocks = load
-                .active_prefill_tokens()
-                .saturating_sub(min_active_prefill_tokens)
-                as f64
-                / context.block_size() as f64;
+            let excess_active_prefill_blocks =
+                load.active_prefill_tokens()
+                    .saturating_sub(min_active_prefill_tokens) as f64
+                    / context.block_size() as f64;
             let normalized_prefill_load =
                 excess_active_prefill_blocks / context.request_blocks() as f64;
             1.0 / (1.0 + overlap_score_credit_decay * normalized_prefill_load)
@@ -494,7 +493,9 @@ impl WorkerPicker for JsewPicker {
         let load = input
             .load()
             .ok_or_else(|| WorkerSelectionPolicyError::failed("load input unavailable"))?;
-        if candidates.is_empty() || cache.len() != candidates.len() || load.len() != candidates.len()
+        if candidates.is_empty()
+            || cache.len() != candidates.len()
+            || load.len() != candidates.len()
         {
             return Err(WorkerSelectionPolicyError::failed("no eligible worker"));
         }
@@ -579,7 +580,11 @@ impl WorkerPicker for JsewPicker {
             .router_temperature_override()
             .unwrap_or(self.config.router_temperature);
         if temperature != 0.0 {
-            return Ok(softmax_sample_row(&self.costs, temperature, fastrand::f64()));
+            return Ok(softmax_sample_row(
+                &self.costs,
+                temperature,
+                fastrand::f64(),
+            ));
         }
 
         // Break ties uniformly, as the built-in selector does, so equal-cost workers do not all
@@ -911,7 +916,10 @@ mod tests {
         };
 
         // A short declared completion leaves the predicted-work term small, so cache credit wins.
-        assert_eq!(select_seq(ground_truth, [unshared(workers)], Some(1))[0], worker(B));
+        assert_eq!(
+            select_seq(ground_truth, [unshared(workers)], Some(1))[0],
+            worker(B)
+        );
         // A long one charges decode backlog hard enough to flip the choice.
         assert_eq!(
             select_seq(ground_truth, [unshared(workers)], Some(100_000))[0],
@@ -948,7 +956,10 @@ mod tests {
             decode_work_scale: 3.0,
             ..neutral()
         };
-        assert_eq!(select_seq(linear, [unshared(warm_cache), unshared(workers)], None)[1], worker(A));
+        assert_eq!(
+            select_seq(linear, [unshared(warm_cache), unshared(workers)], None)[1],
+            worker(A)
+        );
 
         // Sharpening the exponent drives a sub-unit ratio toward zero, quieting the work term for
         // requests larger than the believed arrival and handing the choice back to cache credit.

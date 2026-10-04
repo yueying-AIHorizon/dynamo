@@ -155,8 +155,7 @@ impl JsewPrediction {
     /// asserts `isl_tokens > 0`), but it is clamped here so a synthetic
     /// zero-length request cannot divide by zero.
     pub(super) fn decode_cost_blocks(self, decode_cost_blocks: f64, request_blocks: u64) -> f64 {
-        let decode_to_prefill_ratio =
-            self.predicted_decode_blocks / (request_blocks.max(1) as f64);
+        let decode_to_prefill_ratio = self.predicted_decode_blocks / (request_blocks.max(1) as f64);
         self.decode_footprint_weight * decode_cost_blocks
             + self.decode_work_scale * decode_to_prefill_ratio * decode_cost_blocks
     }

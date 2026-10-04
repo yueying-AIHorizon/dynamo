@@ -22,10 +22,9 @@ use dynamo_kv_router::scheduling::{
 };
 use dynamo_kv_router::sequences::topology::WorkerDpRange;
 use dynamo_kv_router::{
-    ActiveSequencesMultiWorker, RadixTree, RoutingPartitionRef,
-    SchedulingRequest, SequenceRequest, SessionContext, TrackingHashAlgorithm, TrackingHashContext,
-    TrackingHashScope, WorkerLoadProjection, WorkerSelectionInput, WorkerSelector,
-    scheduling::TierOverlapBlocks,
+    ActiveSequencesMultiWorker, RadixTree, RoutingPartitionRef, SchedulingRequest, SequenceRequest,
+    SessionContext, TrackingHashAlgorithm, TrackingHashContext, TrackingHashScope,
+    WorkerLoadProjection, WorkerSelectionInput, WorkerSelector, scheduling::TierOverlapBlocks,
 };
 use dynamo_tokens::SequenceHash;
 use rustc_hash::FxHashMap;
@@ -38,8 +37,7 @@ use crate::replay::ReplayPrefillLoadEstimator;
 use crate::replay::offline::extensions::kv_events::RouterEventBatch;
 use crate::replay::router_shared::{
     ReplayNoopPublisher, ReplayWorkerConfig, ReplayWorkerSelector, replay_router_config,
-    replay_selector_with_seed,
-    replay_slots, replay_worker_config, replay_workers_with_configs,
+    replay_selector_with_seed, replay_slots, replay_worker_config, replay_workers_with_configs,
 };
 use aisimulate_core::replay::loadgen::{ReplayRequestHashes, ReplayRequestPayload};
 use aisimulate_core::replay::{

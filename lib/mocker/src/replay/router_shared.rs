@@ -6,12 +6,12 @@ use std::sync::Arc;
 
 use crate::common::protocols::MockEngineArgs;
 use dynamo_kv_router::config::KvRouterConfig;
+use dynamo_kv_router::protocols::WorkerSelectionResult;
 use dynamo_kv_router::protocols::{
     ActiveSequenceEvent, WorkerConfigLike, WorkerId, WorkerWithDpRank,
 };
 use dynamo_kv_router::scheduling::queue::DEFAULT_MAX_BATCHED_TOKENS;
 use dynamo_kv_router::sequences::SchedulerLoadSnapshot;
-use dynamo_kv_router::protocols::WorkerSelectionResult;
 use dynamo_kv_router::{
     ActiveSequencesMultiWorker, DefaultWorkerSelector, KvSchedulerError, LocalScheduler,
     SequencePublisher, WorkerInputs, WorkerSelectionInput, WorkerSelectionPolicy, WorkerSelector,
@@ -64,6 +64,8 @@ pub(super) type ReplayScheduler =
 /// `router_policy_config` selects one (feature `custom-policy`).
 pub(crate) enum ReplayWorkerSelector {
     Default(DefaultWorkerSelector),
+    /// Only constructed when replay links the shipped policy catalog.
+    #[cfg_attr(not(feature = "custom-policy"), allow(dead_code))]
     Policy(WorkerSelectionPolicy),
 }
 
@@ -77,7 +79,9 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for ReplayWorkerSelector {
 
     fn uses_exclusive_affinity_target(&self) -> bool {
         match self {
-            Self::Default(selector) => WorkerSelector::<C>::uses_exclusive_affinity_target(selector),
+            Self::Default(selector) => {
+                WorkerSelector::<C>::uses_exclusive_affinity_target(selector)
+            }
             Self::Policy(policy) => WorkerSelector::<C>::uses_exclusive_affinity_target(policy),
         }
     }
